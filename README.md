@@ -71,22 +71,22 @@ Example output:
 ```text
 Collection: project_docs (1693 chunks)
 
-  450 chunks  All of Statistics - A Concise Course in Statistical Inference.pdf
-  301 chunks  python.pdf
-    2 chunks  Vjaadhi_Resume_1.pdf
+  450 chunks  reference-book.pdf
+  301 chunks  programming-guide.pdf
+    2 chunks  sample-document.pdf
 ```
 
 Remove one document from search results while retaining its original PDF:
 
 ```bash
-python src/ingest.py --delete "Vjaadhi_Resume_1.pdf"
+python src/ingest.py --delete "sample-document.pdf"
 ```
 
 The command asks for confirmation:
 
 ```text
-Delete 2 indexed chunks for 'Vjaadhi_Resume_1.pdf'? The PDF will be kept. [y/N]: y
-Deleted 2 chunks for 'Vjaadhi_Resume_1.pdf'.
+Delete 2 indexed chunks for 'sample-document.pdf'? The PDF will be kept. [y/N]: y
+Deleted 2 chunks for 'sample-document.pdf'.
 ```
 
 Delete the complete index while retaining all original PDFs:
@@ -99,7 +99,7 @@ For scripts, add `--yes` to either deletion command to skip confirmation. Use
 this carefully:
 
 ```bash
-python src/ingest.py --delete "Vjaadhi_Resume_1.pdf" --yes
+python src/ingest.py --delete "sample-document.pdf" --yes
 python src/ingest.py --clear --yes
 ```
 
