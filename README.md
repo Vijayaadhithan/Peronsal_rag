@@ -1,23 +1,153 @@
-# Local Data Assistant
+# Semantic Advertisement Search
 
-Local RAG assistant using:
+Local-first semantic search for advertisement and ecommerce catalogs.
 
-- MySQL as the ads source table
-- Ollama for embeddings and structured query extraction
-- Chroma for local vector storage
-- BM25 + vector search + BGE cross-encoder reranking
+The system is designed for users who know what they need but may not know the
+product, service, category, brand, or model name. It searches advertisement
+titles, descriptions, keywords, taxonomy, attributes, prices, locations, and
+rental metadata, then returns canonical rows from MySQL.
 
-Current defaults are in `config.yaml`:
+Example:
+
+```text
+something portable that can record a wedding clearly from far away
+```
+
+This can retrieve cameras, drone cameras, portable recorders, microphones,
+gimbals, and related recording equipment without forcing the user to name one
+specific product category.
+
+## Current Stack
+
+- MySQL: source and canonical advertisement records
+- Ollama: local embeddings and structured query extraction
+- Chroma: persistent vector index
+- SQLite FTS5: persistent BM25 keyword index
+- `BAAI/bge-reranker-large`: local cross-encoder reranking
+- Python: ingestion, retrieval, evaluation, and CLI orchestration
+
+Defaults are configured in `config.yaml`:
 
 - Collection: `local_data`
 - Embedding model: `embeddinggemma:latest`
-- Query-extraction model: configured under `query_extraction.model`
+- Query model: `gemma4:12b`
 - Reranker: `BAAI/bge-reranker-large`
-- Chroma storage: `storage/chroma/`
+- Vector candidates: 30
+- BM25 candidates: 30
+- Hybrid candidates: 60
+- Final results: 10
+
+## Search Design
+
+The system separates hard constraints from semantic intent.
+
+### Hard Filters
+
+Hard filters are applied only when they are explicitly requested or safely
+derived from a unique database relationship:
+
+- Offer ads versus wanted ads
+- State, city, and locality
+- Rental duration
+- Minimum and maximum rental fee
+- Explicit main category or subcategory
+
+For example, `Quad Bike in Bangalore per hour` can safely resolve to:
+
+```json
+{
+  "main_category": "Sports & Toys",
+  "subcategory": "Quad Bike",
+  "state": "Karnataka",
+  "city": "Bengaluru",
+  "rental_duration": "Per Hour"
+}
+```
+
+### Soft Category Hints
+
+When a category is inferred from functionality rather than stated by the user,
+it becomes a ranking hint instead of a hard filter.
+
+For example:
+
+```text
+something portable that records distant subjects
+```
+
+The model may infer `Camera`, but Camera is not used to eliminate recorders,
+drone cameras, microphones, or other potentially relevant products.
+
+### DB-Backed Resolution
+
+The persistent BM25 product table is also used to build safe relationship maps:
+
+- Subcategory to main category
+- City to state
+- Locality to city and state
+
+A parent is derived only when the indexed relationship is unique. Ambiguous
+subcategories such as `Technician`, `Consultant`, or `Others` do not force an
+incorrect main category.
+
+The planner also handles:
+
+- Singular and plural category names
+- Common city aliases such as Bangalore/Bengaluru and Bombay/Mumbai
+- Conservative typo recovery such as Coimbtore/Coimbatore
+- Hourly, daily, weekly, monthly, and per-ride language
+- Price ranges and upper/lower budgets
+- Searcher intent versus wanted-ad intent
+
+## End-to-End Search Flow
+
+1. `gemma4:12b` rewrites the request into a semantic query, keyword query, ad
+   intent, and possible structured constraints.
+2. Deterministic validation corrects duration, price, ad type, taxonomy,
+   aliases, spelling, and hierarchy relationships.
+3. Explicit constraints become hard filters. Guessed categories become soft
+   hints.
+4. Chroma retrieves semantically similar advertisement documents.
+5. SQLite FTS5 retrieves exact brands, models, keywords, categories, and
+   attributes using BM25.
+6. Reciprocal Rank Fusion combines vector and BM25 ranks without comparing
+   their incompatible raw scores.
+7. The canonical `ads.type` value removes offer/wanted mismatches before
+   reranking.
+8. `BAAI/bge-reranker-large` scores the original user request against each
+   complete advertisement document.
+9. Repeated exact titles are diversified so duplicates do not occupy all final
+   result positions.
+10. Only ranked advertisement IDs are retained.
+11. Full records are fetched from the canonical `ads` table while preserving
+    reranker order.
+
+The extraction model never generates product records. Returned data always
+comes from MySQL.
+
+## Architecture Boundaries
+
+`ProductSearchEngine` in `src/search_engine.py` exposes the complete:
+
+```text
+plan -> retrieve -> filter -> rerank -> map IDs -> fetch ads
+```
+
+flow. The CLI and evaluation tools use this same implementation.
+
+Provider protocols are defined in `src/providers.py`:
+
+- `EmbeddingProvider`
+- `StructuredQueryProvider`
+- `RerankingProvider`
+
+Ollama is the current local provider. A hosted API can later implement these
+interfaces without replacing filtering, retrieval, fusion, evaluation, or
+MySQL mapping.
 
 ## Setup
 
-Create or update `.env` with your local settings:
+Create `.env`:
 
 ```bash
 OLLAMA_BASE_URL=http://localhost:11434
@@ -29,6 +159,7 @@ MYSQL_USER=root
 MYSQL_PASSWORD=your-local-password
 MYSQL_TABLE=ads_search_ready
 MYSQL_CONTENT_COLUMN=embedding_content
+MYSQL_BM25_COLUMN=bm25_content
 MYSQL_SEARCH_ID_COLUMN=id
 MYSQL_RESULT_TABLE=ads
 MYSQL_RESULT_ID_COLUMN=id
@@ -40,99 +171,90 @@ Install dependencies:
 .venv/bin/python -m pip install -r requirements.txt
 ```
 
-Make sure Ollama has the embedding and chat models:
+Install local Ollama models:
 
 ```bash
 ollama pull embeddinggemma:latest
 ollama pull gemma4:12b
 ```
 
-Use the embedding model configured in `config.yaml`. The BGE reranker is
-downloaded to the local Hugging Face cache on the first search.
+The BGE reranker loads from the local Hugging Face cache. If it is not cached,
+Transformers downloads it on first use.
+
+## MySQL Data Contract
+
+The search index is built from `ads_search_ready`.
+
+Important fields include:
+
+- `id`
+- `embedding_content`
+- `bm25_content`
+- `main_category_name`
+- `subcategory_name`
+- `state_name`
+- `city_name`
+- `locality_name`
+- `rental_duration`
+- `rental_fee`
+
+`embedding_content` is labelled semantic text containing title, description,
+metadata, taxonomy, location, attributes, and selected values.
+
+`bm25_content` contains exact searchable terms such as IDs, brands, models,
+keywords, category names, location names, and attribute values.
+
+The final result source is the canonical `ads` table, joined by advertisement
+ID after reranking.
 
 ## MySQL Ingestion
 
-The current MySQL path reads:
-
-```sql
-SELECT embedding_content FROM ads_search_ready
-```
-
-In practice, `embedding_content` is labelled semantic text, not JSON. A row starts like:
-
-```text
-Title: ...
-Description: ...
-Listing meta title: ...
-Main category: ...
-Subcategory: ...
-State: ...
-City: ...
-Locality: ...
-Selected attributes: ...
-```
-
-During ingestion:
-
-- `embedding_content` becomes the Chroma document text.
-- Known labels are split onto separate lines before embedding.
-- Label values are copied into metadata, such as `content_title`, `content_main_category`, `content_subcategory`, `content_state`, `content_city`, and `content_locality`.
-- Other MySQL table columns are also stored as metadata.
-- Rows are streamed from MySQL, so the process does not load all 250k rows into memory.
-- Chroma upserts happen in batches.
-- `bm25_content` is maintained in the persistent local
-  `storage/bm25.sqlite3` FTS5 index.
-- Each row gets a stable Chroma ID and `source_content_hash`.
-- Re-running ingestion skips rows already indexed with the same embedding model and same content hash.
-- If a MySQL row changes, only that changed row is re-embedded and upserted.
-
-Check the table and planned row count without creating embeddings:
+Validate MySQL configuration without embedding:
 
 ```bash
 .venv/bin/python src/ingest.py --mysql --check --limit 10
 ```
 
-Run a small smoke ingestion first:
+Run a small ingestion:
 
 ```bash
 .venv/bin/python src/ingest.py --mysql --limit 100
 ```
 
-Run the full ingestion:
+Run full incremental ingestion:
 
 ```bash
 .venv/bin/python src/ingest.py --mysql --mysql-batch-size 500 --embed-batch-size 32
 ```
 
-This command is resumable. If it stops halfway, run the same command again; already indexed unchanged rows will be skipped.
+Rows are streamed from MySQL. Stable document IDs and content hashes allow
+unchanged rows to be skipped when ingestion is resumed.
 
-Rebuild only the BM25 index without embeddings or Chroma changes:
+Rebuild only BM25:
 
 ```bash
 .venv/bin/python src/ingest.py --mysql-bm25-only --mysql-batch-size 5000
 ```
 
-Rebuild the MySQL source inside Chroma:
+Replace the MySQL source inside Chroma:
 
 ```bash
-.venv/bin/python src/ingest.py --mysql --mysql-replace-source --mysql-batch-size 500 --embed-batch-size 32
+.venv/bin/python src/ingest.py --mysql --mysql-replace-source
 ```
 
-`--mysql-replace-source` deletes only the indexed Chroma chunks for `mysql:rag_ht_test.ads_search_ready`. It does not delete or update rows in MySQL.
-
-Force re-embedding without deleting first:
+Force all rows to be embedded again:
 
 ```bash
-.venv/bin/python src/ingest.py --mysql --mysql-force-reembed --mysql-batch-size 500 --embed-batch-size 32
+.venv/bin/python src/ingest.py --mysql --mysql-force-reembed
 ```
 
-Use `--mysql-force-reembed` when the embedding model behavior changed but the model name stayed the same, or when you want to refresh vectors even though the source text is unchanged.
+These commands do not update or delete MySQL source rows.
 
 ## Local File Ingestion
 
-The older local-file ingestion still works for files placed in `data/raw_docs/`.
+Files placed in `data/raw_docs/` can also be indexed.
 
-Supported types:
+Supported extensions:
 
 - `.pdf`
 - `.csv`
@@ -140,16 +262,73 @@ Supported types:
 - `.xlsx`
 - `.xlsm`
 
-Validate local files:
+Validate:
 
 ```bash
 .venv/bin/python src/ingest.py --check
 ```
 
-Ingest local files:
+Ingest:
 
 ```bash
 .venv/bin/python src/ingest.py
+```
+
+## Run Search
+
+```bash
+.venv/bin/python src/chat.py
+```
+
+Example queries:
+
+```text
+something portable that can record a wedding clearly from far away in Chennai for a day
+Quad Bike for Hourly Rent in Bangalore
+someone looking for bikes in 1000 range per hour
+need a bike for a week within 800
+```
+
+The reranker is loaded once per process and reused for later queries.
+
+## Evaluation
+
+Run deterministic unit tests:
+
+```bash
+.venv/bin/python -m pytest -q
+```
+
+Run query-understanding scenarios:
+
+```bash
+.venv/bin/python src/evaluate_queries.py
+```
+
+Cases are stored in `eval/query_cases.json`.
+
+Run end-to-end labeled retrieval:
+
+```bash
+.venv/bin/python src/evaluate_retrieval.py
+```
+
+Cases are stored in `eval/retrieval_cases.json`. The evaluator reports passed
+cases and Mean Reciprocal Rank.
+
+Latest verified results:
+
+```text
+47 unit tests passed
+8/8 query-plan cases passed
+4/4 end-to-end retrieval cases passed
+MRR = 0.750
+```
+
+Compile-check:
+
+```bash
+python3 -m compileall -q src tests
 ```
 
 ## Index Management
@@ -160,67 +339,56 @@ List indexed sources:
 .venv/bin/python src/ingest.py --list
 ```
 
-Delete one indexed source from Chroma:
+Delete one Chroma source:
 
 ```bash
 .venv/bin/python src/ingest.py --delete "source-name"
 ```
 
-Clear the whole Chroma collection:
+Clear Chroma:
 
 ```bash
 .venv/bin/python src/ingest.py --clear
 ```
 
-Use `--yes` to skip delete confirmations:
+These operations affect Chroma only. They do not delete source files, BM25
+rows, or MySQL records.
 
-```bash
-.venv/bin/python src/ingest.py --clear --yes
+## Project Structure
+
+```text
+src/
+  chat.py                 Interactive CLI
+  search_engine.py        Reusable end-to-end search service
+  query_planner.py        LLM extraction and deterministic validation
+  retrieval.py            Vector, BM25, RRF, and ad-type filtering
+  reranker.py             BGE cross-encoder adapter
+  providers.py            Replaceable model-provider protocols
+  ollama_client.py        Local Ollama provider
+  bm25_index.py           Persistent SQLite FTS5 index
+  mysql_store.py          MySQL reads and canonical record lookup
+  ingestion_service.py    Incremental ingestion workflows
+  document_processing.py  Source and metadata preparation
+  evaluate_queries.py     Query-plan evaluation
+  evaluate_retrieval.py   End-to-end retrieval evaluation
+eval/
+  query_cases.json
+  retrieval_cases.json
 ```
 
-These commands affect only Chroma index data. They do not delete source files or MySQL rows.
+## Current Limitations
 
-## Product Search
-
-After ingestion:
-
-```bash
-.venv/bin/python src/chat.py
-```
-
-The search path is:
-
-1. The configured query model converts the user request into structured JSON.
-   Deterministic validation then resolves exact categories and locations, maps
-   hourly/daily/weekly/monthly phrases to database values, extracts budget
-   constraints, and distinguishes offer ads from wanted ads.
-2. Chroma retrieves the nearest 100 `embedding_content` candidates without an
-   expensive metadata scan, then exact filters are applied locally.
-3. SQLite FTS5 executes BM25 against the persistent `bm25_content` index only
-   after a query is submitted. Chat startup does not load or rebuild the corpus.
-4. Explicit filters are resolved against indexed metadata and applied to both
-   retrieval paths. Unrecognized filters are ignored rather than eliminating
-   valid products.
-5. Vector and BM25 candidates are merged and scored by
-   `BAAI/bge-reranker-large`.
-6. Only the ranked product IDs are retained.
-7. Canonical rows are returned from `ads` with a parameterized
-   `SELECT * FROM ads WHERE id IN (...)`, preserving reranker order.
-
-The query-extraction LLM does not generate the final response. Product data
-always comes from the canonical `ads` table. The cached BGE reranker is loaded
-locally on the first query, without a Hugging Face network check.
-
-## Verification
-
-Run tests:
-
-```bash
-.venv/bin/python -m pytest -q
-```
-
-Compile-check source and tests:
-
-```bash
-python3 -m compileall -q src tests
-```
+- Query extraction and local embedding latency depend on Ollama model size and
+  hardware.
+- The first reranking request pays the BGE model-loading cost.
+- The labeled retrieval set is intentionally small and must grow before making
+  production-quality claims.
+- Soft category boosts and candidate counts still require benchmark-driven
+  tuning.
+- The current canonical lookup does not exclude records based on `status` or
+  `deleted_at`. A production deployment must define the advertisement
+  visibility policy with the owning team.
+- City aliases are not a complete geographic knowledge base.
+- Exact-title diversification can hide multiple legitimate listings with the
+  same title; business-specific deduplication should eventually use seller,
+  location, price, and availability.
