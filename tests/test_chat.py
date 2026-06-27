@@ -1,6 +1,8 @@
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from bm25_index import PersistentBM25Index
@@ -10,9 +12,12 @@ from chat import (
     MYSQL_SEARCH_ID_COLUMN,
     MYSQL_TABLE,
     enrich_query_plan,
+    extract_duration_filter,
     extract_price_constraints,
     extract_product_ids,
     fetch_products_by_ids,
+    filter_candidates_by_ad_type,
+    infer_target_ad_type,
     metadata_matches_filters,
     parse_query_plan,
     query_filter_value_index,
@@ -146,12 +151,121 @@ def test_enrich_query_plan_restores_exact_filters_and_keyword_intent():
     assert enriched["filters"]["max_rental_fee"] == 1500
 
 
+def test_enrich_query_plan_overrides_wrong_duration_category_and_intent():
+    plan = {
+        "semantic_query": "rent car",
+        "keyword_query": "car rental",
+        "target_ad_type": "wanted",
+        "filters": {
+            "main_category": None,
+            "subcategory": "Caravan",
+            "state": None,
+            "city": None,
+            "locality": None,
+            "rental_duration": "Per Week",
+            "min_rental_fee": None,
+            "max_rental_fee": None,
+        },
+        "fallback_reason": None,
+    }
+    value_index = {
+        "main_category": {"automobiles": "Automobiles"},
+        "subcategory": {"car": "Car", "caravan": "Caravan"},
+        "state": {},
+        "city": {"coimbatore": "Coimbatore"},
+        "locality": {},
+        "rental_duration": {
+            "per hour": "Per Hour",
+            "per week": "Per Week",
+        },
+    }
+
+    enriched = enrich_query_plan(
+        "hourly rental car within 800 in Coimbatore",
+        plan,
+        value_index,
+    )
+
+    assert enriched["target_ad_type"] == "offer"
+    assert enriched["filters"]["subcategory"] == "Car"
+    assert enriched["filters"]["city"] == "Coimbatore"
+    assert enriched["filters"]["rental_duration"] == "Per Hour"
+    assert enriched["filters"]["max_rental_fee"] == 800
+
+
+@pytest.mark.parametrize(
+    ("query", "expected"),
+    [
+        ("hourly car rental", "Per Hour"),
+        ("bike for a day", "Per Day"),
+        ("weekly bike rental", "Per Week"),
+        ("car for one month", "Per Month"),
+        ("taxi per ride", "Per Ride"),
+    ],
+)
+def test_extract_duration_filter_maps_natural_language(query, expected):
+    values = {
+        normalize.lower(): normalize
+        for normalize in ("Per Hour", "Per Day", "Per Week", "Per Month", "Per Ride")
+    }
+    assert extract_duration_filter(query, values) == expected
+
+
+def test_infer_target_ad_type_uses_searcher_perspective():
+    assert infer_target_ad_type("I need a bike for a week") == "offer"
+    assert infer_target_ad_type("looking for a rental car") == "offer"
+    assert infer_target_ad_type("show people who need a rental car") == "wanted"
+    assert infer_target_ad_type("someone looking for bikes") == "wanted"
+    assert infer_target_ad_type("a person who needs a bike") == "wanted"
+    assert infer_target_ad_type("show wanted ads for bikes") == "wanted"
+
+
 def test_extract_price_constraints_handles_range_and_minimum():
     assert extract_price_constraints("bike between Rs 1000 and Rs 2500") == (
         1000,
         2500,
     )
     assert extract_price_constraints("room above ₹750") == (750, None)
+    assert extract_price_constraints("hourly car within 800") == (None, 800)
+    assert extract_price_constraints("bike in 1000 range per hour") == (None, 1000)
+
+
+def test_enrich_query_plan_handles_people_seeking_hourly_bikes():
+    plan = {
+        "semantic_query": "bike",
+        "keyword_query": "bike",
+        "target_ad_type": "offer",
+        "filters": {
+            "main_category": None,
+            "subcategory": None,
+            "state": None,
+            "city": None,
+            "locality": None,
+            "rental_duration": None,
+            "min_rental_fee": None,
+            "max_rental_fee": None,
+        },
+        "fallback_reason": None,
+    }
+    value_index = {
+        "main_category": {},
+        "subcategory": {"bike": "Bike"},
+        "state": {},
+        "city": {},
+        "locality": {},
+        "rental_duration": {"per hour": "Per Hour"},
+    }
+
+    enriched = enrich_query_plan(
+        "someone looking for bikes in 1000 range per hour",
+        plan,
+        value_index,
+    )
+
+    assert enriched["target_ad_type"] == "wanted"
+    assert enriched["filters"]["subcategory"] == "Bike"
+    assert enriched["filters"]["rental_duration"] == "Per Hour"
+    assert enriched["filters"]["max_rental_fee"] == 1000
 
 
 def test_persistent_bm25_index_searches_without_loading_corpus(tmp_path):
@@ -287,6 +401,41 @@ def test_extract_product_ids_skips_non_product_sources():
     ]
 
     assert extract_product_ids(reranked) == [3]
+
+
+def test_filter_candidates_by_ad_type_excludes_wanted_ads():
+    candidates = [
+        {
+            "id": "doc-1",
+            "metadata": {
+                "source_type": "mysql",
+                "source_table": MYSQL_TABLE,
+                MYSQL_SEARCH_ID_COLUMN: 10,
+            },
+        },
+        {
+            "id": "doc-2",
+            "metadata": {
+                "source_type": "mysql",
+                "source_table": MYSQL_TABLE,
+                MYSQL_SEARCH_ID_COLUMN: 20,
+            },
+        },
+    ]
+    connection = FakeConnection(
+        [
+            {MYSQL_RESULT_ID_COLUMN: "10", "type": "1"},
+            {MYSQL_RESULT_ID_COLUMN: "20", "type": "2"},
+        ]
+    )
+
+    offers = filter_candidates_by_ad_type(
+        candidates,
+        "offer",
+        connection=connection,
+    )
+
+    assert [candidate["id"] for candidate in offers] == ["doc-1"]
 
 
 def test_fetch_products_by_ids_preserves_reranker_order():

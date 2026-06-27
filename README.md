@@ -11,7 +11,7 @@ Current defaults are in `config.yaml`:
 
 - Collection: `local_data`
 - Embedding model: `embeddinggemma:latest`
-- Query-extraction model: `gemma3:1b`
+- Query-extraction model: configured under `query_extraction.model`
 - Reranker: `BAAI/bge-reranker-large`
 - Chroma storage: `storage/chroma/`
 
@@ -44,7 +44,7 @@ Make sure Ollama has the embedding and chat models:
 
 ```bash
 ollama pull embeddinggemma:latest
-ollama pull gemma3:1b
+ollama pull gemma4:12b
 ```
 
 Use the embedding model configured in `config.yaml`. The BGE reranker is
@@ -190,9 +190,10 @@ After ingestion:
 
 The search path is:
 
-1. `gemma3:1b` converts the user request into structured JSON containing a
-   semantic query, a keyword query, and explicit category/location/duration/price
-   filters.
+1. The configured query model converts the user request into structured JSON.
+   Deterministic validation then resolves exact categories and locations, maps
+   hourly/daily/weekly/monthly phrases to database values, extracts budget
+   constraints, and distinguishes offer ads from wanted ads.
 2. Chroma retrieves the nearest 100 `embedding_content` candidates without an
    expensive metadata scan, then exact filters are applied locally.
 3. SQLite FTS5 executes BM25 against the persistent `bm25_content` index only
