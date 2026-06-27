@@ -1,8 +1,9 @@
 chromadb>=1.5,<2
-FlashRank>=0.2,<1
+openpyxl>=3.1,<4
 pypdf>=6,<7
+PyMySQL>=1.1,<2
 python-dotenv>=1,<2
 PyYAML>=6,<7
-rank-bm25>=0.2,<1
 requests>=2.32,<3
-
+torch>=2.7,<3
+transformers>=5,<6

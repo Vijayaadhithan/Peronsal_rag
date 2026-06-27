@@ -1,7 +1,14 @@
+app_name: Local Data Assistant
+collection_name: local_data
+#gemma3:1b
 llm:
   model: gemma4:12b
   temperature: 0.2
   think: false
+
+query_extraction:
+  model: gemma4:12b
+  temperature: 0.2
 
 embedding:
   model: embeddinggemma:latest
@@ -13,6 +20,11 @@ chunking:
   chunk_overlap: 80
 
 retrieval:
+  vector_candidate_k: 100
   vector_top_k: 15
   bm25_top_k: 15
   final_top_k: 6
+  reranker_model: BAAI/bge-reranker-large
+  reranker_batch_size: 4
+  reranker_max_length: 512
+  reranker_use_fp16: false
