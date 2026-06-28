@@ -252,6 +252,8 @@ GEMINI_TIMEOUT_SECONDS=10
 REDIS_ENABLED=true
 REDIS_URL=redis://127.0.0.1:6379/0
 REDIS_KEY_PREFIX=semantic_ads
+REDIS_RESULT_CACHE_ENABLED=true
+REDIS_RESULT_CACHE_TTL_SECONDS=300
 
 MYSQL_HOST=localhost
 MYSQL_PORT=3306
@@ -406,7 +408,7 @@ Expected startup output:
 
 ```text
 INFO: Waiting for application startup.
-INFO: Redis query-plan cache connected key_prefix=semantic_ads
+INFO: Redis cache connected key_prefix=semantic_ads
 INFO: Preloading reranker Alibaba-NLP/gte-reranker-modernbert-base once for this process...
 INFO: Reranker ready in 2797 ms.
 INFO: Preloading the Ollama embedding model...
@@ -440,6 +442,14 @@ API restart or be reused by another worker. Redis keys contain a SHA-256 digest
 of the normalized query rather than the query text. If Redis is stopped,
 search continues with the in-process cache and periodically retries Redis.
 Disable Redis with `REDIS_ENABLED=false`.
+
+Successful search result ordering is cached separately in Redis for five
+minutes. This cache contains product IDs, ranking tiers, and interpreted
+filters—not full product descriptions or photos. A repeated query therefore
+skips planning, embeddings, BM25, fusion, and reranking, while current
+canonical rows and visibility state are fetched again from MySQL. Result keys
+include the BM25 index revision and automatically change after ingestion.
+Disable this layer with `REDIS_RESULT_CACHE_ENABLED=false`.
 
 When a model is exhausted or temporarily unavailable, a warning shows the HTTP
 status and next model. Logs include model names, stage timings, candidate
@@ -485,7 +495,9 @@ Example health output:
   },
   "redis_enabled": true,
   "redis_connected": true,
-  "query_plan_cache_backend": "redis+memory"
+  "query_plan_cache_backend": "redis+memory",
+  "result_cache_enabled": true,
+  "result_cache_ttl_seconds": 300
 }
 ```
 
@@ -524,6 +536,7 @@ The response shape is:
     "target_ad_type": "offer",
     "execution_path": "deterministic_filter",
     "plan_cache_hit": false,
+    "result_cache_hit": false,
     "query_corrections": []
   },
   "applied_filters": {
@@ -616,7 +629,9 @@ The server constructs the configured combined result window once and keeps it
 in memory for 10 minutes by default. Cursor requests return stable slices from
 that window, so scrolling does not repeat query extraction, embeddings,
 retrieval, reranking, or related-tail selection. Cursor responses have
-`"cached": true`. A cursor is intentionally opaque; the frontend should store
+`"cached": true`. Repeating a query can also return `"cached": true` when its
+Redis result-ID cache is hit; `interpreted_query.result_cache_hit` distinguishes
+that case. A cursor is intentionally opaque; the frontend should store
 and return it unchanged. An expired cursor returns HTTP `410`, and the frontend
 must start a new search using `query`.
 

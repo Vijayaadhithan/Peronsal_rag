@@ -130,6 +130,8 @@ class HealthResponse(BaseModel):
     redis_enabled: bool
     redis_connected: bool
     query_plan_cache_backend: str
+    result_cache_enabled: bool
+    result_cache_ttl_seconds: int
 
 
 @dataclass
@@ -250,6 +252,8 @@ class ProductSearchService:
                     "redis_enabled": False,
                     "redis_connected": False,
                     "query_plan_cache_backend": "memory",
+                    "result_cache_enabled": False,
+                    "result_cache_ttl_seconds": 0,
                 }
             )
         return HealthResponse(
@@ -269,7 +273,9 @@ class ProductSearchService:
         if request.query is not None:
             session = self._start_search(request.query)
             offset = 0
-            cached = False
+            cached = bool(
+                session.interpreted_query.get("result_cache_hit")
+            )
         else:
             search_id, offset = decode_cursor(request.cursor or "")
             session = self.sessions.get(search_id)
@@ -293,6 +299,7 @@ class ProductSearchService:
                     "semantic",
                 ),
                 "plan_cache_hit": bool(result.get("plan_cache_hit")),
+                "result_cache_hit": bool(result.get("result_cache_hit")),
                 "query_corrections": query_plan.get(
                     "query_corrections",
                     [],
@@ -306,6 +313,11 @@ class ProductSearchService:
             "related_tail": result.get("related_tail_seconds", 0.0) * 1000,
             "reranker_load": result.get("reranker_load_seconds", 0.0) * 1000,
             "reranking": result.get("reranker_seconds", 0.0) * 1000,
+            "result_cache": result.get(
+                "result_cache_seconds",
+                0.0,
+            )
+            * 1000,
             "total": total_ms,
         }
         query_metrics = result.get("query_model_metrics") or {}

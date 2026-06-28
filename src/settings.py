@@ -102,6 +102,18 @@ REDIS_KEY_PREFIX = os.getenv(
     "REDIS_KEY_PREFIX",
     str(REDIS_CONFIG.get("key_prefix", "semantic_ads")),
 )
+RESULT_CACHE_ENABLED = _env_bool(
+    "REDIS_RESULT_CACHE_ENABLED",
+    bool(REDIS_CONFIG.get("result_cache_enabled", True)),
+)
+RESULT_CACHE_TTL_SECONDS = int(
+    os.getenv(
+        "REDIS_RESULT_CACHE_TTL_SECONDS",
+        str(REDIS_CONFIG.get("result_cache_ttl_seconds", 300)),
+    )
+)
+if RESULT_CACHE_TTL_SECONDS <= 0:
+    raise ValueError("REDIS_RESULT_CACHE_TTL_SECONDS must be greater than zero.")
 
 CHUNK_SIZE = int(CONFIG.get("chunking", {}).get("chunk_size", 512))
 CHUNK_OVERLAP = int(CONFIG.get("chunking", {}).get("chunk_overlap", 80))

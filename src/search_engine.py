@@ -1,5 +1,5 @@
-import logging
 import hashlib
+import logging
 import time
 import uuid
 from collections import OrderedDict
@@ -38,6 +38,8 @@ from settings import (
     QUERY_PLAN_CACHE_SIZE,
     QUERY_PLAN_CACHE_TTL_SECONDS,
     RELATED_TAIL_ENABLED,
+    RESULT_CACHE_ENABLED,
+    RESULT_CACHE_TTL_SECONDS,
     RERANK_CANDIDATE_K,
     RETRIEVAL_OVERFETCH_FACTOR,
     RERANK_MODEL,
@@ -47,6 +49,7 @@ from settings import (
 )
 
 LOGGER = logging.getLogger("uvicorn.error")
+RESULT_CACHE_SCHEMA_VERSION = "v1"
 
 
 def active_filter_names(filters: dict) -> list[str]:
@@ -104,6 +107,8 @@ class ProductSearchEngine:
                 "redis_enabled": False,
                 "redis_connected": False,
                 "query_plan_cache_backend": "memory",
+                "result_cache_enabled": False,
+                "result_cache_ttl_seconds": RESULT_CACHE_TTL_SECONDS,
             }
         return {
             "redis_enabled": True,
@@ -115,7 +120,158 @@ class ProductSearchEngine:
                 if getattr(self.shared_plan_cache, "connected", False)
                 else "memory_fallback"
             ),
+            "result_cache_enabled": RESULT_CACHE_ENABLED,
+            "result_cache_ttl_seconds": RESULT_CACHE_TTL_SECONDS,
         }
+
+    def _result_cache_key(self, query: str, limit: int | None) -> str:
+        version_parts = (
+            RESULT_CACHE_SCHEMA_VERSION,
+            str(self.bm25_index.revision()),
+            str(self.bm25_index.count()),
+            str(limit),
+            RERANK_MODEL,
+            str(RERANK_CANDIDATE_K),
+            str(PRIMARY_RANKED_K),
+            self._query_cache_key(query),
+        )
+        return hashlib.sha256("\0".join(version_parts).encode()).hexdigest()
+
+    def _cached_search_result(
+        self,
+        query: str,
+        limit: int | None,
+        trace_id: str,
+    ) -> dict | None:
+        if not RESULT_CACHE_ENABLED or self.shared_plan_cache is None:
+            return None
+        started = time.perf_counter()
+        cache_key = self._result_cache_key(query, limit)
+        cached = self.shared_plan_cache.get_json(
+            "search_result",
+            cache_key,
+        )
+        if cached is None:
+            LOGGER.info(
+                "[search:%s] step=result_cache status=miss duration_ms=%.0f",
+                trace_id,
+                (time.perf_counter() - started) * 1000,
+            )
+            return None
+        required = {
+            "query_plan",
+            "resolved_filters",
+            "unresolved_filters",
+            "product_ids",
+            "primary_product_ids",
+            "related_product_ids",
+        }
+        if not required.issubset(cached) or not isinstance(
+            cached["product_ids"],
+            list,
+        ):
+            LOGGER.warning(
+                "[search:%s] step=result_cache status=invalid",
+                trace_id,
+            )
+            return None
+
+        mysql_started = time.perf_counter()
+        products = fetch_products_by_ids(cached["product_ids"])
+        primary_identities = {
+            str(product_id)
+            for product_id in cached["primary_product_ids"]
+        }
+        deterministic = (
+            cached["query_plan"].get("execution_path")
+            == "deterministic_filter"
+        )
+        products = [
+            {
+                **product,
+                "result_tier": (
+                    "filtered"
+                    if deterministic
+                    else (
+                        "ranked"
+                        if str(product.get(MYSQL_RESULT_ID_COLUMN))
+                        in primary_identities
+                        else "related"
+                    )
+                ),
+            }
+            for product in products
+        ]
+        elapsed = time.perf_counter() - started
+        LOGGER.info(
+            "[search:%s] step=result_cache status=hit ids=%d rows=%d "
+            "mysql_ms=%.0f duration_ms=%.0f",
+            trace_id,
+            len(cached["product_ids"]),
+            len(products),
+            (time.perf_counter() - mysql_started) * 1000,
+            elapsed * 1000,
+        )
+        return {
+            "query_plan": cached["query_plan"],
+            "resolved_filters": cached["resolved_filters"],
+            "unresolved_filters": cached["unresolved_filters"],
+            "query_model_metrics": {},
+            "seconds": 0.0,
+            "plan_cache_hit": True,
+            "vector_results": [],
+            "bm25_results": [],
+            "candidates": [],
+            "vector_seconds": 0.0,
+            "bm25_seconds": 0.0,
+            "embedding_model_metrics": {},
+            "reranked": [],
+            "reranker_load_seconds": 0.0,
+            "reranker_seconds": 0.0,
+            "related_tail_seconds": 0.0,
+            "primary_product_ids": cached["primary_product_ids"],
+            "related_product_ids": cached["related_product_ids"],
+            "product_ids": cached["product_ids"],
+            "products": products,
+            "result_cache_hit": True,
+            "result_cache_seconds": elapsed,
+        }
+
+    def _cache_search_result(
+        self,
+        query: str,
+        limit: int | None,
+        result: dict,
+    ) -> None:
+        if (
+            not RESULT_CACHE_ENABLED
+            or self.shared_plan_cache is None
+            or result["query_plan"].get("fallback_reason")
+        ):
+            return
+        payload = {
+            "query_plan": result["query_plan"],
+            "resolved_filters": result["resolved_filters"],
+            "unresolved_filters": result["unresolved_filters"],
+            "product_ids": [
+                str(product_id)
+                for product_id in result.get("product_ids", [])
+            ],
+            "primary_product_ids": [
+                str(product_id)
+                for product_id in result.get("primary_product_ids", [])
+            ],
+            "related_product_ids": [
+                str(product_id)
+                for product_id in result.get("related_product_ids", [])
+            ],
+        }
+        self.shared_plan_cache.set_json(
+            "search_result",
+            self._result_cache_key(query, limit),
+            payload,
+            RESULT_CACHE_TTL_SECONDS,
+        )
 
     def _cached_plan(self, query: str) -> dict | None:
         if QUERY_PLAN_CACHE_SIZE <= 0 or QUERY_PLAN_CACHE_TTL_SECONDS <= 0:
@@ -505,17 +661,35 @@ class ProductSearchEngine:
             len(query),
             limit if limit is not None else "default",
         )
+        cached_result = self._cached_search_result(
+            query,
+            limit,
+            trace_id,
+        )
+        if cached_result is not None:
+            LOGGER.info(
+                "[search:%s] step=search status=complete "
+                "path=result_cache products=%d duration_ms=%.0f",
+                trace_id,
+                len(cached_result["products"]),
+                (time.perf_counter() - started) * 1000,
+            )
+            return cached_result
         planned = self.plan(query, trace_id=trace_id)
         if (
             planned["query_plan"].get("execution_path")
             == "deterministic_filter"
         ):
-            return self._filtered_search(
+            result = self._filtered_search(
                 planned,
                 limit,
                 trace_id,
                 started,
             )
+            result["result_cache_hit"] = False
+            result["result_cache_seconds"] = 0.0
+            self._cache_search_result(query, limit, result)
+            return result
         retrieved = self.retrieve(
             planned["query_plan"],
             planned["resolved_filters"],
@@ -606,7 +780,7 @@ class ProductSearchEngine:
             len(products),
             (time.perf_counter() - started) * 1000,
         )
-        return {
+        result = {
             **planned,
             **retrieved,
             "reranked": ranked["results"],
@@ -617,4 +791,8 @@ class ProductSearchEngine:
             "related_product_ids": related_product_ids,
             "product_ids": product_ids,
             "products": products,
+            "result_cache_hit": False,
+            "result_cache_seconds": 0.0,
         }
+        self._cache_search_result(query, limit, result)
+        return result

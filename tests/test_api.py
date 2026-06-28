@@ -164,12 +164,34 @@ def test_http_contract_and_validation():
     assert health.json()["redis_enabled"] is False
     assert health.json()["redis_connected"] is False
     assert health.json()["query_plan_cache_backend"] == "memory"
+    assert health.json()["result_cache_enabled"] is False
     assert service.engine.reranker_loads == 1
     assert response.status_code == 200
     assert response.json()["pagination"]["returned"] == 2
     assert response.json()["pagination"]["has_more"] is True
     assert response.json()["interpreted_query"]["query_corrections"] == []
+    assert response.json()["interpreted_query"]["result_cache_hit"] is False
     assert invalid.status_code == 422
+
+
+def test_repeated_query_result_cache_is_reported_by_api():
+    class ResultCachingEngine(FakeEngine):
+        def search(self, query, limit=None):
+            result = super().search(query, limit)
+            result["result_cache_hit"] = len(self.calls) > 1
+            result["result_cache_seconds"] = 0.002
+            return result
+
+    service = ProductSearchService(ResultCachingEngine(), max_results=20)
+
+    first = service.search(SearchRequest(query="camera", page_size=2))
+    repeated = service.search(SearchRequest(query="camera", page_size=2))
+
+    assert first.cached is False
+    assert first.interpreted_query["result_cache_hit"] is False
+    assert repeated.cached is True
+    assert repeated.interpreted_query["result_cache_hit"] is True
+    assert repeated.timings_ms["result_cache"] == 2.0
 
 
 def test_api_keeps_wanted_status_two_and_excludes_soft_deleted_products():

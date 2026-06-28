@@ -52,6 +52,14 @@ class PersistentBM25Index:
                 rental_fee REAL
             );
 
+            CREATE TABLE IF NOT EXISTS index_metadata (
+                key TEXT PRIMARY KEY,
+                value INTEGER NOT NULL
+            );
+
+            INSERT OR IGNORE INTO index_metadata(key, value)
+            VALUES ('revision', 0);
+
             CREATE VIRTUAL TABLE IF NOT EXISTS products_fts USING fts5(
                 content,
                 content='products',
@@ -103,9 +111,22 @@ class PersistentBM25Index:
         ).fetchone()
         return int(row["row_count"])
 
+    def revision(self) -> int:
+        row = self.connection.execute(
+            "SELECT value FROM index_metadata WHERE key = 'revision'"
+        ).fetchone()
+        return int(row["value"])
+
+    def _increment_revision(self) -> None:
+        self.connection.execute(
+            "UPDATE index_metadata SET value = value + 1 "
+            "WHERE key = 'revision'"
+        )
+
     def clear(self) -> None:
         with self.connection:
             self.connection.execute("DELETE FROM products")
+            self._increment_revision()
 
     def upsert(self, rows: list[dict]) -> None:
         if not rows:
@@ -154,6 +175,7 @@ class PersistentBM25Index:
                 """,
                 values,
             )
+            self._increment_revision()
 
     def filter_value_index(self) -> dict:
         value_index = {}

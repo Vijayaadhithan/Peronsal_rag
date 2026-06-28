@@ -90,7 +90,7 @@ class RedisJsonCache:
         try:
             value = json.loads(raw)
         except (TypeError, json.JSONDecodeError):
-            LOGGER.warning("Ignoring invalid JSON in the Redis plan cache.")
+            LOGGER.warning("Ignoring invalid JSON in the Redis cache.")
             return None
         return value if isinstance(value, dict) else None
 
@@ -125,7 +125,7 @@ def create_redis_cache(
     key_prefix: str,
 ) -> RedisJsonCache | None:
     if not enabled:
-        LOGGER.info("Redis query-plan cache is disabled; using process memory.")
+        LOGGER.info("Redis cache is disabled; using process memory.")
         return None
     try:
         cache = RedisJsonCache(url, key_prefix)
@@ -134,12 +134,12 @@ def create_redis_cache(
         return None
     if cache.ping(force=True):
         LOGGER.info(
-            "Redis query-plan cache connected key_prefix=%s",
+            "Redis cache connected key_prefix=%s",
             cache.key_prefix,
         )
     else:
         LOGGER.warning(
-            "Redis query-plan cache is unavailable; using process memory "
+            "Redis cache is unavailable; using process memory "
             "and retrying in the background."
         )
     return cache

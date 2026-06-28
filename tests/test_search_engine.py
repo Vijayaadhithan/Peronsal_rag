@@ -284,7 +284,73 @@ def test_shared_plan_cache_survives_engine_restart(tmp_path):
         "redis_enabled": True,
         "redis_connected": True,
         "query_plan_cache_backend": "redis+memory",
+        "result_cache_enabled": True,
+        "result_cache_ttl_seconds": 300,
     }
+    index.close()
+
+
+def test_result_id_cache_skips_repeated_search_and_invalidates_on_index_change(
+    tmp_path,
+    monkeypatch,
+):
+    index = build_index(tmp_path / "result-cache.sqlite3")
+    cache = DictSharedCache()
+    engine = ProductSearchEngine(
+        collection=FakeCollection(),
+        bm25_index=index,
+        shared_plan_cache=cache,
+    )
+    browse_calls = []
+
+    def browse(*_args, **_kwargs):
+        browse_calls.append(True)
+        return [101, 102]
+
+    monkeypatch.setattr(search_engine, "related_tail_product_ids", browse)
+    monkeypatch.setattr(
+        search_engine,
+        "fetch_products_by_ids",
+        lambda ids: [{"id": product_id} for product_id in ids],
+    )
+
+    first = engine.search("bike", limit=20)
+    restarted_engine = ProductSearchEngine(
+        collection=FakeCollection(),
+        bm25_index=index,
+        shared_plan_cache=cache,
+    )
+    second = restarted_engine.search("  BIKE ", limit=20)
+
+    assert first["result_cache_hit"] is False
+    assert second["result_cache_hit"] is True
+    assert len(browse_calls) == 1
+    assert [str(product["id"]) for product in second["products"]] == [
+        "101",
+        "102",
+    ]
+    assert all(
+        product["result_tier"] == "filtered"
+        for product in second["products"]
+    )
+    assert any(
+        namespace == "search_result"
+        for namespace, _key in cache.values
+    )
+
+    index.upsert(
+        [
+            product_row(
+                "second-bike",
+                main_category_name="Automobiles",
+                subcategory_name="Bike",
+            )
+        ]
+    )
+    third = restarted_engine.search("bike", limit=20)
+
+    assert third["result_cache_hit"] is False
+    assert len(browse_calls) == 2
     index.close()
 
 
