@@ -38,6 +38,9 @@ chunking:
   chunk_overlap: 80
 
 retrieval:
+  # Source rows commonly use 0 or 1 as "price not supplied". Such rows remain
+  # searchable but rank after every genuine price in price-sorted searches.
+  unpriced_rental_fee_ceiling: 1
   vector_candidate_k: 100
   vector_top_k: 30
   bm25_top_k: 30

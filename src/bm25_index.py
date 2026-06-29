@@ -2,7 +2,7 @@ import re
 import sqlite3
 from pathlib import Path
 
-from settings import BM25_INDEX_PATH
+from settings import BM25_INDEX_PATH, UNPRICED_RENTAL_FEE_CEILING
 
 FILTER_COLUMNS = (
     "main_category_name",
@@ -267,9 +267,14 @@ class PersistentBM25Index:
             conditions.append(f"p.{column} = ?")
             params.append(value)
         if "min_rental_fee" in resolved_filters:
+            conditions.append("p.rental_fee > ?")
+            params.append(UNPRICED_RENTAL_FEE_CEILING)
             conditions.append("p.rental_fee >= ?")
             params.append(resolved_filters["min_rental_fee"])
         if "max_rental_fee" in resolved_filters:
+            if "min_rental_fee" not in resolved_filters:
+                conditions.append("p.rental_fee > ?")
+                params.append(UNPRICED_RENTAL_FEE_CEILING)
             conditions.append("p.rental_fee <= ?")
             params.append(resolved_filters["max_rental_fee"])
 
@@ -301,10 +306,13 @@ class PersistentBM25Index:
         category_filters: dict[str, str] | None = None,
         exclude_doc_ids: set[str] | None = None,
         offset: int = 0,
+        sort_order: str | None = None,
     ) -> list[dict]:
         """Return filtered category rows without requiring a keyword match."""
         if top_k <= 0 or offset < 0:
             return []
+        if sort_order not in {None, "price_asc", "price_desc"}:
+            raise ValueError(f"Unsupported browse sort order: {sort_order}")
 
         conditions = []
         params: list = []
@@ -323,9 +331,14 @@ class PersistentBM25Index:
             conditions.append(f"{column} = ?")
             params.append(value)
         if "min_rental_fee" in resolved_filters:
+            conditions.append("rental_fee > ?")
+            params.append(UNPRICED_RENTAL_FEE_CEILING)
             conditions.append("rental_fee >= ?")
             params.append(resolved_filters["min_rental_fee"])
         if "max_rental_fee" in resolved_filters:
+            if "min_rental_fee" not in resolved_filters:
+                conditions.append("rental_fee > ?")
+                params.append(UNPRICED_RENTAL_FEE_CEILING)
             conditions.append("rental_fee <= ?")
             params.append(resolved_filters["max_rental_fee"])
 
@@ -340,13 +353,27 @@ class PersistentBM25Index:
             if conditions
             else ""
         )
+        order_clause = {
+            "price_asc": (
+                "CASE WHEN rental_fee IS NULL OR rental_fee <= ? "
+                "THEN 1 ELSE 0 END, rental_fee IS NULL, "
+                "rental_fee ASC, rowid DESC"
+            ),
+            "price_desc": (
+                "CASE WHEN rental_fee IS NULL OR rental_fee <= ? "
+                "THEN 1 ELSE 0 END, rental_fee IS NULL, "
+                "rental_fee DESC, rowid DESC"
+            ),
+        }.get(sort_order, "rowid DESC")
+        if sort_order in {"price_asc", "price_desc"}:
+            params.append(UNPRICED_RENTAL_FEE_CEILING)
         params.extend((top_k, offset))
         rows = self.connection.execute(
             f"""
             SELECT doc_id, product_id
             FROM products
             {where_clause}
-            ORDER BY rowid DESC
+            ORDER BY {order_clause}
             LIMIT ? OFFSET ?
             """,
             params,

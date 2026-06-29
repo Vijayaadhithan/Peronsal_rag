@@ -465,6 +465,12 @@ def test_filters_resolve_case_insensitively_and_apply_to_both_searches(tmp_path)
                 city_name="Chennai",
                 rental_fee=1200.0,
             ),
+            product_index_row(
+                "3",
+                "bike",
+                city_name="Coimbatore",
+                rental_fee=1.0,
+            ),
         ]
     )
     filters = {
@@ -497,6 +503,15 @@ def test_filters_resolve_case_insensitively_and_apply_to_both_searches(tmp_path)
             "source_file": "mysql:test.ads_search_ready",
             "city_name": "Chennai",
             "rental_fee": 900,
+        },
+        "mysql:test.ads_search_ready",
+        resolved,
+    )
+    assert not metadata_matches_filters(
+        {
+            "source_file": "mysql:test.ads_search_ready",
+            "city_name": "Coimbatore",
+            "rental_fee": 1,
         },
         "mysql:test.ads_search_ready",
         resolved,

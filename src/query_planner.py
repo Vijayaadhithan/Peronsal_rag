@@ -165,6 +165,37 @@ FAST_PATH_DURATION_TOKENS = {
     "week",
     "weekly",
 }
+FAST_PATH_SORT_TOKENS = {
+    "asc",
+    "ascending",
+    "affordable",
+    "budget",
+    "cheap",
+    "cheapest",
+    "cost",
+    "costs",
+    "desc",
+    "descending",
+    "expensive",
+    "fee",
+    "fees",
+    "first",
+    "friendly",
+    "high",
+    "highest",
+    "least",
+    "low",
+    "lowest",
+    "most",
+    "order",
+    "ordered",
+    "price",
+    "prices",
+    "rate",
+    "rates",
+    "sort",
+    "sorted",
+}
 OFFER_AD_TYPE = "1"
 WANTED_AD_TYPE = "2"
 DURATION_PATTERNS = (
@@ -264,6 +295,7 @@ def default_query_plan(query: str, fallback_reason: str | None = None) -> dict:
         "semantic_query": query,
         "keyword_query": query,
         "target_ad_type": "offer",
+        "sort_order": None,
         "filters": {key: None for key in QUERY_FILTER_KEYS},
         "inferred_categories": {
             "main_category": None,
@@ -788,6 +820,51 @@ def extract_price_constraints(query: str) -> tuple[float | None, float | None]:
     return minimum, maximum
 
 
+def extract_sort_order(query: str) -> str | None:
+    """Extract explicit price ordering without treating it as relevance text."""
+    normalized = normalize_filter_value(query)
+    price_term = r"(?:rental\s+)?(?:price|prices|rate|rates|rent|fee|fees)"
+    low_to_high = (
+        rf"(?:{price_term}\s+(?:from\s+)?low(?:est)?\s+to\s+high(?:est)?|"
+        rf"low(?:est)?\s+to\s+high(?:est)?\s+{price_term})"
+    )
+    high_to_low = (
+        rf"(?:{price_term}\s+(?:from\s+)?high(?:est)?\s+to\s+low(?:est)?|"
+        rf"high(?:est)?\s+to\s+low(?:est)?\s+{price_term})"
+    )
+    if re.search(rf"\b{low_to_high}\b", normalized):
+        return "price_asc"
+    if re.search(rf"\b{high_to_low}\b", normalized):
+        return "price_desc"
+    ascending_patterns = (
+        r"\b(?:cheapest|lowest(?:[\s-]+priced)?|least[\s-]+expensive)\b",
+        r"\b(?:cheap|affordable|budget[\s-]+friendly)\b",
+        rf"\b(?:low|lowest|minimum|min)\s+{price_term}\b",
+        r"\blow(?:est)?\s+(?:cost|costs)\b",
+        rf"\b{price_term}\s+(?:from\s+)?low(?:est)?\s+to\s+high(?:est)?\b",
+        rf"\blow(?:est)?\s+to\s+high(?:est)?\s+{price_term}\b",
+        rf"\b(?:sort|order|sorted|ordered)(?:\s+by)?\s+{price_term}"
+        rf"\s+(?:asc|ascending|low(?:est)?\s+to\s+high(?:est)?)\b",
+        rf"\b(?:asc|ascending)\s+{price_term}\b",
+        rf"\b{price_term}\s+(?:asc|ascending)\b",
+    )
+    descending_patterns = (
+        r"\b(?:most[\s-]+expensive|highest(?:[\s-]+priced)?)\b",
+        rf"\b(?:high|highest|maximum|max)\s+{price_term}\b",
+        rf"\b{price_term}\s+(?:from\s+)?high(?:est)?\s+to\s+low(?:est)?\b",
+        rf"\bhigh(?:est)?\s+to\s+low(?:est)?\s+{price_term}\b",
+        rf"\b(?:sort|order|sorted|ordered)(?:\s+by)?\s+{price_term}"
+        rf"\s+(?:desc|descending|high(?:est)?\s+to\s+low(?:est)?)\b",
+        rf"\b(?:desc|descending)\s+{price_term}\b",
+        rf"\b{price_term}\s+(?:desc|descending)\b",
+    )
+    if any(re.search(pattern, normalized) for pattern in ascending_patterns):
+        return "price_asc"
+    if any(re.search(pattern, normalized) for pattern in descending_patterns):
+        return "price_desc"
+    return None
+
+
 def extract_standalone_budget(query: str) -> float | None:
     """Infer one bare amount only for the conservative direct-filter path."""
     normalized = query.casefold().replace(",", "")
@@ -990,6 +1067,7 @@ def enrich_query_plan(query: str, plan: dict, value_index: dict) -> dict:
     plan["filters"] = filters
     plan["inferred_categories"] = inferred_categories
     plan["target_ad_type"] = infer_target_ad_type(query)
+    plan["sort_order"] = extract_sort_order(query)
     return plan
 
 
@@ -998,10 +1076,24 @@ def deterministic_filter_query_plan(
     value_index: dict,
 ) -> dict | None:
     """Return a direct-filter plan for simple explicit catalog queries."""
+    sort_order = extract_sort_order(query)
     corrected_query, corrections = correct_explicit_query_typos(
         query,
         value_index,
     )
+    # In a rental catalog, "car retail" alongside explicit price ordering is
+    # overwhelmingly a typo for "car rental". Keep the correction narrow so a
+    # genuine retail query without ordering still goes through semantic search.
+    if sort_order and re.search(r"\bretail\b", corrected_query.casefold()):
+        corrected_query = re.sub(
+            r"\bretail\b",
+            "rental",
+            corrected_query,
+            flags=re.IGNORECASE,
+        )
+        corrections.append(
+            {"field": "intent", "input": "retail", "value": "rental"}
+        )
     plan = enrich_query_plan(
         corrected_query,
         default_query_plan(corrected_query),
@@ -1052,6 +1144,8 @@ def deterministic_filter_query_plan(
         allowed_tokens.update(FAST_PATH_PRICE_TOKENS)
     if has_duration:
         allowed_tokens.update(FAST_PATH_DURATION_TOKENS)
+    if plan.get("sort_order"):
+        allowed_tokens.update(FAST_PATH_SORT_TOKENS)
 
     unexplained_tokens = []
     for token in re.findall(r"[^\W_]+", residual):

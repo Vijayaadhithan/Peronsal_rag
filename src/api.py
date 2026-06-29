@@ -290,7 +290,12 @@ class ProductSearchService:
         query_plan = result["query_plan"]
         interpreted_query = {
             key: query_plan.get(key)
-            for key in ("semantic_query", "keyword_query", "target_ad_type")
+            for key in (
+                "semantic_query",
+                "keyword_query",
+                "target_ad_type",
+                "sort_order",
+            )
         }
         interpreted_query.update(
             {

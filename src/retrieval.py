@@ -7,6 +7,7 @@ from settings import (
     BM25_WEIGHT,
     CHROMA_DIR,
     COLLECTION_NAME,
+    UNPRICED_RENTAL_FEE_CEILING,
     MYSQL_SEARCH_ID_COLUMN,
     MYSQL_TABLE,
     RRF_CONSTANT,
@@ -39,6 +40,8 @@ def metadata_matches_filters(metadata, source_name, resolved_filters) -> bool:
     try:
         rental_fee = float(metadata.get("rental_fee"))
     except (TypeError, ValueError):
+        return False
+    if rental_fee <= UNPRICED_RENTAL_FEE_CEILING:
         return False
     if minimum is not None and rental_fee < minimum:
         return False
@@ -139,6 +142,7 @@ def related_tail_product_ids(
     exclude_doc_ids=None,
     exclude_product_ids=None,
     type_fetcher=fetch_product_types_by_ids,
+    sort_order=None,
 ):
     """Return a stable filtered tail without requiring keyword relevance."""
     if limit <= 0:
@@ -186,6 +190,7 @@ def related_tail_product_ids(
             category_filters=category_filters,
             exclude_doc_ids=set(exclude_doc_ids or set()),
             offset=offset,
+            sort_order=sort_order,
         )
         if not rows:
             break

@@ -40,6 +40,7 @@ class FakeEngine:
                 "semantic_query": query,
                 "keyword_query": query,
                 "target_ad_type": "offer",
+                "sort_order": "price_asc",
             },
             "resolved_filters": {"categorical": {"city_name": "Chennai"}},
             "unresolved_filters": {},
@@ -170,6 +171,7 @@ def test_http_contract_and_validation():
     assert response.json()["pagination"]["returned"] == 2
     assert response.json()["pagination"]["has_more"] is True
     assert response.json()["interpreted_query"]["query_corrections"] == []
+    assert response.json()["interpreted_query"]["sort_order"] == "price_asc"
     assert response.json()["interpreted_query"]["result_cache_hit"] is False
     assert invalid.status_code == 422
 

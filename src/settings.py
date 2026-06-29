@@ -118,6 +118,14 @@ if RESULT_CACHE_TTL_SECONDS <= 0:
 CHUNK_SIZE = int(CONFIG.get("chunking", {}).get("chunk_size", 512))
 CHUNK_OVERLAP = int(CONFIG.get("chunking", {}).get("chunk_overlap", 80))
 
+UNPRICED_RENTAL_FEE_CEILING = float(
+    CONFIG.get("retrieval", {}).get("unpriced_rental_fee_ceiling", 1)
+)
+if UNPRICED_RENTAL_FEE_CEILING < 0:
+    raise ValueError(
+        "retrieval.unpriced_rental_fee_ceiling cannot be negative."
+    )
+
 VECTOR_CANDIDATE_K = int(
     CONFIG.get("retrieval", {}).get("vector_candidate_k", 100)
 )

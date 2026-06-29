@@ -31,6 +31,7 @@ from settings import (
     BM25_TOP_K,
     EMBED_MODEL,
     HYBRID_CANDIDATE_K,
+    UNPRICED_RENTAL_FEE_CEILING,
     MYSQL_RESULT_ID_COLUMN,
     PRIMARY_RANKED_K,
     QUERY_DETERMINISTIC_FAST_PATH,
@@ -49,7 +50,7 @@ from settings import (
 )
 
 LOGGER = logging.getLogger("uvicorn.error")
-RESULT_CACHE_SCHEMA_VERSION = "v1"
+RESULT_CACHE_SCHEMA_VERSION = "v3"
 
 
 def active_filter_names(filters: dict) -> list[str]:
@@ -599,6 +600,7 @@ class ProductSearchEngine:
             planned["query_plan"].get("inferred_categories"),
             planned["query_plan"]["target_ad_type"],
             result_limit,
+            sort_order=planned["query_plan"].get("sort_order"),
         )
         browse_seconds = time.perf_counter() - browse_started
         LOGGER.info(
@@ -731,6 +733,7 @@ class ProductSearchEngine:
                     for result in ranked["results"]
                 },
                 exclude_product_ids=set(primary_product_ids),
+                sort_order=planned["query_plan"].get("sort_order"),
             )
         related_tail_seconds = time.perf_counter() - tail_started
         product_ids = list(
@@ -769,6 +772,25 @@ class ProductSearchEngine:
             }
             for product in products
         ]
+        sort_order = planned["query_plan"].get("sort_order")
+        if sort_order in {"price_asc", "price_desc"}:
+            descending = sort_order == "price_desc"
+
+            def price_key(product):
+                try:
+                    price = float(product.get("rental_fee"))
+                except (TypeError, ValueError):
+                    return (1, 0.0)
+                if price <= UNPRICED_RENTAL_FEE_CEILING:
+                    return (1, price)
+                return (0, -price if descending else price)
+
+            products.sort(key=price_key)
+            product_ids = [
+                product[MYSQL_RESULT_ID_COLUMN]
+                for product in products
+                if product.get(MYSQL_RESULT_ID_COLUMN) is not None
+            ]
         LOGGER.info(
             "[search:%s] step=mysql_map status=complete rows=%d",
             trace_id,

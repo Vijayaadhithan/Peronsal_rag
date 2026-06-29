@@ -8,6 +8,7 @@ import search_engine
 from bm25_index import PersistentBM25Index
 from query_planner import (
     deterministic_filter_query_plan,
+    extract_sort_order,
     query_filter_value_index,
 )
 from search_engine import ProductSearchEngine
@@ -163,6 +164,163 @@ def test_deterministic_filter_plan_accepts_reordered_bare_budget_query(
     assert typo["filters"]["subcategory"] == "Bike"
     assert typo["filters"]["city"] == "Chennai"
     assert typo["filters"]["max_rental_fee"] == 1000
+    index.close()
+
+
+def test_lowest_price_query_uses_sorted_filter_path_and_corrects_retail_typo(
+    tmp_path,
+):
+    index = build_index(tmp_path / "sorted-fast-plan.sqlite3")
+    index.upsert(
+        [
+            product_row(
+                "car-coimbatore",
+                main_category_name="Automobiles",
+                subcategory_name="Car",
+                state_name="Tamil Nadu",
+                city_name="Coimbatore",
+                rental_fee=250,
+            )
+        ]
+    )
+    value_index = query_filter_value_index(index)
+
+    plan = deterministic_filter_query_plan(
+        "lowest price car retail in coimbatore",
+        value_index,
+    )
+
+    assert plan["execution_path"] == "deterministic_filter"
+    assert plan["sort_order"] == "price_asc"
+    assert plan["filters"]["subcategory"] == "Car"
+    assert plan["filters"]["city"] == "Coimbatore"
+    assert plan["query_corrections"] == [
+        {"field": "intent", "input": "retail", "value": "rental"}
+    ]
+    index.close()
+
+
+def test_price_sort_fast_path_is_category_agnostic(tmp_path):
+    index = PersistentBM25Index(tmp_path / "generic-price-sort.sqlite3")
+    index.upsert(
+        [
+            product_row(
+                "bike-chennai",
+                main_category_name="Automobiles",
+                subcategory_name="Bike",
+                state_name="Tamil Nadu",
+                city_name="Chennai",
+                rental_duration="Per Day",
+                rental_fee=100,
+            ),
+            product_row(
+                "camera-chennai",
+                main_category_name="Audio & Video Equipments",
+                subcategory_name="Camera",
+                state_name="Tamil Nadu",
+                city_name="Chennai",
+                rental_duration="Per Day",
+                rental_fee=250,
+            ),
+            product_row(
+                "room-chennai",
+                main_category_name="Accommodation & Spaces",
+                subcategory_name="Room",
+                state_name="Tamil Nadu",
+                city_name="Chennai",
+                rental_duration="Per Month",
+                rental_fee=5000,
+            ),
+        ]
+    )
+    value_index = query_filter_value_index(index)
+    cases = (
+        ("cheapest daily bike in Chennai", "Bike", "Per Day"),
+        ("lowest price camera per day in Chennai", "Camera", "Per Day"),
+        ("most affordable room per month in Chennai", "Room", "Per Month"),
+    )
+
+    for query, subcategory, duration in cases:
+        plan = deterministic_filter_query_plan(query, value_index)
+        assert plan["execution_path"] == "deterministic_filter"
+        assert plan["sort_order"] == "price_asc"
+        assert plan["filters"]["subcategory"] == subcategory
+        assert plan["filters"]["rental_duration"] == duration
+
+    index.close()
+
+
+def test_price_sort_wording_is_extracted_deterministically():
+    ascending = (
+        "cheapest car",
+        "lowest priced bike",
+        "low rental rate camera",
+        "affordable car rental",
+        "budget-friendly bike",
+        "price low to high",
+        "low to high rental fees",
+        "sort by price ascending",
+        "rental rate ascending",
+    )
+    descending = (
+        "most expensive car",
+        "highest price bike",
+        "rental fee high to low",
+        "high to low price",
+        "order by rate desc",
+        "price descending",
+    )
+
+    assert all(extract_sort_order(query) == "price_asc" for query in ascending)
+    assert all(extract_sort_order(query) == "price_desc" for query in descending)
+    assert extract_sort_order("car under 1000") is None
+
+
+def test_browse_orders_the_complete_filtered_window_by_rental_fee(tmp_path):
+    index = PersistentBM25Index(tmp_path / "price-browse.sqlite3")
+    index.upsert(
+        [
+            product_row("car-5000", city_name="Coimbatore", rental_fee=5000),
+            product_row("car-250", city_name="Coimbatore", rental_fee=250),
+            product_row("car-null", city_name="Coimbatore", rental_fee=None),
+            product_row("car-900", city_name="Coimbatore", rental_fee=900),
+            product_row("car-zero", city_name="Coimbatore", rental_fee=0),
+            product_row("car-one", city_name="Coimbatore", rental_fee=1),
+        ]
+    )
+    filters = {"categorical": {"city_name": "Coimbatore"}}
+
+    ascending = index.browse(filters, 10, sort_order="price_asc")
+    descending = index.browse(filters, 10, sort_order="price_desc")
+
+    assert [row["doc_id"] for row in ascending] == [
+        "car-250",
+        "car-900",
+        "car-5000",
+        "car-zero",
+        "car-one",
+        "car-null",
+    ]
+    assert [row["doc_id"] for row in descending] == [
+        "car-5000",
+        "car-900",
+        "car-250",
+        "car-one",
+        "car-zero",
+        "car-null",
+    ]
+    under_1000 = index.browse(
+        {
+            "categorical": {"city_name": "Coimbatore"},
+            "max_rental_fee": 1000,
+        },
+        10,
+        sort_order="price_asc",
+    )
+    assert [row["doc_id"] for row in under_1000] == [
+        "car-250",
+        "car-900",
+    ]
     index.close()
 
 
