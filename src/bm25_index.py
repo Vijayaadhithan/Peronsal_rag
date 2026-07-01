@@ -1,5 +1,6 @@
 import re
 import sqlite3
+import threading
 from pathlib import Path
 
 from settings import BM25_INDEX_PATH, UNPRICED_RENTAL_FEE_CEILING
@@ -25,10 +26,11 @@ def tokenize_query(text: str) -> list[str]:
 class PersistentBM25Index:
     def __init__(self, path: Path | str = BM25_INDEX_PATH):
         self.path = Path(path)
+        self._lock = threading.RLock()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         # The API creates the index during application startup and serves
-        # synchronous requests from worker threads. Access is serialized by
-        # ProductSearchService, so the connection can safely cross threads.
+        # synchronous requests from worker threads. Short SQLite operations
+        # are serialized here while vector/model/database work stays parallel.
         self.connection = sqlite3.connect(self.path, check_same_thread=False)
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA journal_mode=WAL")
@@ -103,18 +105,21 @@ class PersistentBM25Index:
         self.connection.commit()
 
     def close(self) -> None:
-        self.connection.close()
+        with self._lock:
+            self.connection.close()
 
     def count(self) -> int:
-        row = self.connection.execute(
-            "SELECT COUNT(*) AS row_count FROM products"
-        ).fetchone()
+        with self._lock:
+            row = self.connection.execute(
+                "SELECT COUNT(*) AS row_count FROM products"
+            ).fetchone()
         return int(row["row_count"])
 
     def revision(self) -> int:
-        row = self.connection.execute(
-            "SELECT value FROM index_metadata WHERE key = 'revision'"
-        ).fetchone()
+        with self._lock:
+            row = self.connection.execute(
+                "SELECT value FROM index_metadata WHERE key = 'revision'"
+            ).fetchone()
         return int(row["value"])
 
     def _increment_revision(self) -> None:
@@ -124,9 +129,10 @@ class PersistentBM25Index:
         )
 
     def clear(self) -> None:
-        with self.connection:
-            self.connection.execute("DELETE FROM products")
-            self._increment_revision()
+        with self._lock:
+            with self.connection:
+                self.connection.execute("DELETE FROM products")
+                self._increment_revision()
 
     def upsert(self, rows: list[dict]) -> None:
         if not rows:
@@ -146,36 +152,37 @@ class PersistentBM25Index:
             )
             for row in rows
         ]
-        with self.connection:
-            self.connection.executemany(
-                """
-                INSERT INTO products (
-                    doc_id,
-                    product_id,
-                    content,
-                    main_category_name,
-                    subcategory_name,
-                    state_name,
-                    city_name,
-                    locality_name,
-                    rental_duration,
-                    rental_fee
+        with self._lock:
+            with self.connection:
+                self.connection.executemany(
+                    """
+                    INSERT INTO products (
+                        doc_id,
+                        product_id,
+                        content,
+                        main_category_name,
+                        subcategory_name,
+                        state_name,
+                        city_name,
+                        locality_name,
+                        rental_duration,
+                        rental_fee
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(doc_id) DO UPDATE SET
+                        product_id = excluded.product_id,
+                        content = excluded.content,
+                        main_category_name = excluded.main_category_name,
+                        subcategory_name = excluded.subcategory_name,
+                        state_name = excluded.state_name,
+                        city_name = excluded.city_name,
+                        locality_name = excluded.locality_name,
+                        rental_duration = excluded.rental_duration,
+                        rental_fee = excluded.rental_fee
+                    """,
+                    values,
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(doc_id) DO UPDATE SET
-                    product_id = excluded.product_id,
-                    content = excluded.content,
-                    main_category_name = excluded.main_category_name,
-                    subcategory_name = excluded.subcategory_name,
-                    state_name = excluded.state_name,
-                    city_name = excluded.city_name,
-                    locality_name = excluded.locality_name,
-                    rental_duration = excluded.rental_duration,
-                    rental_fee = excluded.rental_fee
-                """,
-                values,
-            )
-            self._increment_revision()
+                self._increment_revision()
 
     def filter_value_index(self) -> dict:
         value_index = {}
@@ -279,17 +286,18 @@ class PersistentBM25Index:
             params.append(resolved_filters["max_rental_fee"])
 
         params.append(top_k)
-        rows = self.connection.execute(
-            f"""
-            SELECT p.doc_id, p.product_id, bm25(products_fts) AS rank
-            FROM products_fts
-            JOIN products AS p ON p.rowid = products_fts.rowid
-            WHERE {' AND '.join(conditions)}
-            ORDER BY rank
-            LIMIT ?
-            """,
-            params,
-        ).fetchall()
+        with self._lock:
+            rows = self.connection.execute(
+                f"""
+                SELECT p.doc_id, p.product_id, bm25(products_fts) AS rank
+                FROM products_fts
+                JOIN products AS p ON p.rowid = products_fts.rowid
+                WHERE {' AND '.join(conditions)}
+                ORDER BY rank
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
         return [
             {
                 "doc_id": row["doc_id"],
@@ -368,16 +376,17 @@ class PersistentBM25Index:
         if sort_order in {"price_asc", "price_desc"}:
             params.append(UNPRICED_RENTAL_FEE_CEILING)
         params.extend((top_k, offset))
-        rows = self.connection.execute(
-            f"""
-            SELECT doc_id, product_id
-            FROM products
-            {where_clause}
-            ORDER BY {order_clause}
-            LIMIT ? OFFSET ?
-            """,
-            params,
-        ).fetchall()
+        with self._lock:
+            rows = self.connection.execute(
+                f"""
+                SELECT doc_id, product_id
+                FROM products
+                {where_clause}
+                ORDER BY {order_clause}
+                LIMIT ? OFFSET ?
+                """,
+                params,
+            ).fetchall()
         return [
             {
                 "doc_id": row["doc_id"],

@@ -1,0 +1,80 @@
+company:
+  id: gainr
+  planner_adapter: gainr
+
+planner:
+  enabled: true
+  prompt_context: >-
+    Gainr is a rental advertisement marketplace. Results can represent
+    products, equipment, properties, vehicles, or services. Preserve the
+    searcher's perspective: a person who wants to rent or hire an available
+    listing needs offer ads; a supplier searching for people who need their
+    item or service needs wanted ads.
+
+api:
+  endpoint_slug: gainr
+  key_envs:
+    - GAINR_API_KEY
+
+database:
+  backend: mysql
+  host_env: MYSQL_HOST
+  port_env: MYSQL_PORT
+  database_env: MYSQL_DATABASE
+  user_env: MYSQL_USER
+  password_env: MYSQL_PASSWORD
+  search_ready_table: ads_search_ready
+  content_column: embedding_content
+  bm25_column: bm25_content
+  search_id_column: id
+  result_table: ads
+  result_id_column: id
+  result_type_column: type
+
+storage:
+  vector_backend: chroma
+  chroma_dir: storage/chroma
+  collection_name: company_gainr
+  bm25_path: storage/companies/gainr/bm25.sqlite3
+
+payload:
+  request_mapping:
+    query: query
+    cursor: cursor
+    page_size: page_size
+  public_fields:
+    - result_tier
+    - id
+    - type
+    - category_type
+    - parent_id
+    - category_id
+    - title
+    - slug
+    - description
+    - rental_duration
+    - rental_fee
+    - is_rent_negotiable
+    - city_id
+    - locality_id
+    - custom_locality
+    - photos
+    - total_favorite
+    - total_like
+    - users_rating_count
+    - rating_avg
+    - created_at
+    - updated_at
+  field_mapping: {}
+  filter_schema:
+    main_category_name: keyword
+    subcategory_name: keyword
+    state_name: keyword
+    city_name: keyword
+    locality_name: keyword
+    rental_duration: keyword
+    rental_fee: number
+
+rate_limit:
+  requests_per_minute: 120
+  burst: 20

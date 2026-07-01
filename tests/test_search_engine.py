@@ -1,5 +1,6 @@
 import json
 import sys
+import threading
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -28,6 +29,31 @@ class CountingQueryProvider:
             {
                 "semantic_query": "red bike",
                 "keyword_query": "red bike",
+                "target_ad_type": "offer",
+                "filters": {},
+            }
+        )
+
+
+class CapturingQueryProvider(CountingQueryProvider):
+    def __init__(self):
+        super().__init__()
+        self.system_prompt = ""
+
+    def structured_chat(
+        self,
+        _model,
+        system_prompt,
+        _user_prompt,
+        _schema,
+        _temperature,
+    ):
+        self.calls += 1
+        self.system_prompt = system_prompt
+        return json.dumps(
+            {
+                "semantic_query": "portable recording equipment",
+                "keyword_query": "camera recorder",
                 "target_ad_type": "offer",
                 "filters": {},
             }
@@ -96,6 +122,51 @@ def test_deterministic_filter_plan_accepts_simple_explicit_queries(tmp_path):
     assert filtered["filters"]["max_rental_fee"] == 1000
     assert wanted["target_ad_type"] == "wanted"
     index.close()
+
+
+def test_tenant_prompt_context_is_added_only_to_llm_planning(tmp_path):
+    index = build_index(tmp_path / "tenant-prompt.sqlite3")
+    provider = CapturingQueryProvider()
+    engine = ProductSearchEngine(
+        collection=FakeCollection(),
+        bm25_index=index,
+        query_provider=provider,
+        planner_prompt_context="This tenant rents professional event equipment.",
+    )
+    try:
+        result = engine.plan("equipment for recording a distant wedding")
+    finally:
+        engine.close()
+        index.close()
+
+    assert result["query_plan"]["execution_path"] == "semantic"
+    assert provider.calls == 1
+    assert (
+        "This tenant rents professional event equipment."
+        in provider.system_prompt
+    )
+
+
+def test_disabled_tenant_llm_planner_keeps_semantic_retrieval_available(tmp_path):
+    index = build_index(tmp_path / "disabled-planner.sqlite3")
+    provider = CountingQueryProvider()
+    engine = ProductSearchEngine(
+        collection=FakeCollection(),
+        bm25_index=index,
+        query_provider=provider,
+        planner_enabled=False,
+    )
+    try:
+        result = engine.plan("equipment for recording a distant wedding")
+    finally:
+        engine.close()
+        index.close()
+
+    assert result["query_plan"]["execution_path"] == "semantic"
+    assert result["query_plan"]["semantic_query"] == (
+        "equipment for recording a distant wedding"
+    )
+    assert provider.calls == 0
 
 
 def test_deterministic_filter_plan_corrects_category_and_city_typos(tmp_path):
@@ -558,4 +629,46 @@ def test_simple_query_skips_model_retrieval_and_reranking(tmp_path, monkeypatch)
         "filtered",
         "filtered",
     ]
+    index.close()
+
+
+def test_semantic_vector_and_bm25_retrieval_start_in_parallel(
+    tmp_path,
+    monkeypatch,
+):
+    index = build_index(tmp_path / "parallel-retrieval.sqlite3")
+    engine = ProductSearchEngine(
+        collection=FakeCollection(),
+        bm25_index=index,
+    )
+    barrier = threading.Barrier(2, timeout=2)
+
+    def vector(*_args, **_kwargs):
+        barrier.wait()
+        return []
+
+    def bm25(*_args, **_kwargs):
+        barrier.wait()
+        return []
+
+    monkeypatch.setattr(search_engine, "vector_search", vector)
+    monkeypatch.setattr(search_engine, "bm25_search", bm25)
+    monkeypatch.setattr(
+        search_engine,
+        "filter_candidates_by_ad_type",
+        lambda candidates, *_args, **_kwargs: candidates,
+    )
+
+    result = engine.retrieve(
+        {
+            "semantic_query": "red bike",
+            "keyword_query": "red bike",
+            "target_ad_type": "offer",
+            "inferred_categories": {},
+        },
+        {"categorical": {}},
+    )
+
+    assert result["vector_results"] == []
+    assert result["bm25_results"] == []
     index.close()

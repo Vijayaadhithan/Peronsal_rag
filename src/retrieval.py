@@ -16,18 +16,29 @@ from settings import (
 )
 
 
-def load_collection():
-    client = chromadb.PersistentClient(path=CHROMA_DIR)
+def load_collection(
+    chroma_dir=CHROMA_DIR,
+    collection_name=COLLECTION_NAME,
+):
+    client = chromadb.PersistentClient(path=str(chroma_dir))
     try:
-        return client.get_collection(COLLECTION_NAME)
+        return client.get_collection(collection_name)
     except Exception as exc:
         raise RuntimeError(
-            "No vector collection found. Run: python src/ingest.py"
+            f"No vector collection {collection_name!r} found. "
+            "Run the tenant ingestion job first."
         ) from exc
 
 
-def metadata_matches_filters(metadata, source_name, resolved_filters) -> bool:
+def metadata_matches_filters(
+    metadata,
+    source_name,
+    resolved_filters,
+    company_id=None,
+) -> bool:
     if metadata.get("source_file") != source_name:
+        return False
+    if company_id is not None and metadata.get("company_id") != company_id:
         return False
     for key, expected in resolved_filters["categorical"].items():
         if metadata.get(key) != expected:
@@ -58,6 +69,7 @@ def vector_search(
     source_name=None,
     resolved_filters=None,
     embedding_provider=None,
+    company_id=None,
 ):
     if collection.count() <= 0:
         return []
@@ -87,6 +99,7 @@ def vector_search(
                 metadata,
                 source_name,
                 resolved_filters,
+                company_id,
             )
         ):
             continue
@@ -260,21 +273,25 @@ def merge_results(
     )
 
 
-def extract_product_ids(candidates):
+def extract_product_ids(
+    candidates,
+    search_table=MYSQL_TABLE,
+    search_id_column=MYSQL_SEARCH_ID_COLUMN,
+):
     product_ids = []
     seen = set()
 
     for result in candidates:
         metadata = result.get("metadata") or {}
-        if metadata.get("source_type") != "mysql":
+        if metadata.get("source_type") not in {"mysql", "postgres"}:
             continue
-        if metadata.get("source_table") != MYSQL_TABLE:
+        if metadata.get("source_table") != search_table:
             continue
 
-        product_id = metadata.get(MYSQL_SEARCH_ID_COLUMN)
+        product_id = metadata.get(search_id_column)
         if (
             product_id is None
-            and metadata.get("primary_key_column") == MYSQL_SEARCH_ID_COLUMN
+            and metadata.get("primary_key_column") == search_id_column
         ):
             product_id = metadata.get("primary_key_value")
         if product_id is None:
@@ -292,14 +309,31 @@ def filter_candidates_by_ad_type(
     candidates,
     target_ad_type: str,
     connection=None,
+    type_fetcher=None,
+    search_table=MYSQL_TABLE,
+    search_id_column=MYSQL_SEARCH_ID_COLUMN,
 ):
     expected_type = WANTED_AD_TYPE if target_ad_type == "wanted" else OFFER_AD_TYPE
-    product_ids = extract_product_ids(candidates)
-    product_types = fetch_product_types_by_ids(product_ids, connection=connection)
+    product_ids = extract_product_ids(
+        candidates,
+        search_table=search_table,
+        search_id_column=search_id_column,
+    )
+    if type_fetcher is None:
+        product_types = fetch_product_types_by_ids(
+            product_ids,
+            connection=connection,
+        )
+    else:
+        product_types = type_fetcher(product_ids)
 
     filtered = []
     for candidate in candidates:
-        candidate_ids = extract_product_ids([candidate])
+        candidate_ids = extract_product_ids(
+            [candidate],
+            search_table=search_table,
+            search_id_column=search_id_column,
+        )
         if not candidate_ids:
             continue
         if product_types.get(str(candidate_ids[0])) == expected_type:

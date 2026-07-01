@@ -3,6 +3,7 @@ fastapi>=0.115,<1
 openpyxl>=3.1,<4
 pypdf>=6,<7
 PyMySQL>=1.1,<2
+psycopg[binary]>=3.2,<4
 python-dotenv>=1,<2
 PyYAML>=6,<7
 requests>=2.32,<3

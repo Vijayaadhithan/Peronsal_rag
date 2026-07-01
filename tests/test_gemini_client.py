@@ -1,4 +1,5 @@
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -28,9 +29,9 @@ class FakeResponse:
 
 def test_configured_query_model_fallback_order():
     assert QUERY_EXTRACT_MODELS == (
+        "gemini-3.1-flash-lite",
         "gemma-4-26b-a4b-it",
         "gemma-4-31b-it",
-        "gemini-3.1-flash-lite",
     )
 
 
@@ -104,6 +105,67 @@ def test_structured_chat_requires_api_key():
             "user",
             {"type": "object"},
         )
+
+
+def test_provider_captures_google_usage_metadata(monkeypatch):
+    class UsageResponse(FakeResponse):
+        def json(self):
+            payload = super().json()
+            payload["usageMetadata"] = {
+                "promptTokenCount": 120,
+                "candidatesTokenCount": 30,
+                "thoughtsTokenCount": 10,
+                "totalTokenCount": 160,
+            }
+            return payload
+
+    monkeypatch.setattr(
+        "gemini_client.requests.post",
+        lambda *_args, **_kwargs: UsageResponse(
+            {
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [{"text": '{"query":"camera"}'}],
+                        }
+                    }
+                ]
+            }
+        ),
+    )
+    provider = GeminiProvider(
+        api_key="test-key",
+        base_url="https://generativelanguage.test/v1beta",
+    )
+
+    provider.structured_chat(
+        "model-a",
+        "system",
+        "user",
+        {"type": "object"},
+    )
+
+    assert provider.last_chat_metrics["input_tokens"] == 120
+    assert provider.last_chat_metrics["output_tokens"] == 30
+    assert provider.last_chat_metrics["thought_tokens"] == 10
+    assert provider.last_chat_metrics["total_tokens"] == 160
+
+
+def test_provider_metrics_are_thread_local():
+    provider = GeminiProvider(api_key="test-key")
+    provider.last_chat_metrics = {"model": "main"}
+    child_value = {}
+
+    def set_child_metrics():
+        provider.last_chat_metrics = {"model": "child"}
+        child_value.update(provider.last_chat_metrics)
+
+    thread = threading.Thread(target=set_child_metrics)
+    thread.start()
+    thread.join()
+
+    assert child_value == {"model": "child"}
+    assert provider.last_chat_metrics == {"model": "main"}
 
 
 def test_strip_json_fence_accepts_gemma_markdown_wrapper():

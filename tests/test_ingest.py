@@ -14,6 +14,7 @@ from ingest import (
     content_hash,
     metadata_value,
     mysql_current_ids,
+    mysql_document_id,
     prepare_content_document,
     prepare_mysql_row,
     prepare_source,
@@ -99,6 +100,42 @@ def test_prepare_mysql_row_uses_embedding_content_as_document():
     assert metadata["city"] == "Chennai"
     assert metadata["price"] == 12500.0
     assert "embedding_content" not in metadata
+
+
+def test_mysql_document_ids_are_company_isolated():
+    alpha = mysql_document_id(
+        "search_ready",
+        42,
+        database="catalog",
+        company_id="alpha",
+    )
+    beta = mysql_document_id(
+        "search_ready",
+        42,
+        database="catalog",
+        company_id="beta",
+    )
+
+    assert alpha != beta
+
+
+def test_database_document_ids_are_backend_isolated():
+    mysql_id = mysql_document_id(
+        "search_ready",
+        42,
+        database="catalog",
+        company_id="alpha",
+        backend="mysql",
+    )
+    postgres_id = mysql_document_id(
+        "search_ready",
+        42,
+        database="catalog",
+        company_id="alpha",
+        backend="postgres",
+    )
+
+    assert mysql_id != postgres_id
 
 
 def test_prepare_content_document_extracts_json_semantic_text():

@@ -1,16 +1,24 @@
 import hashlib
 import logging
+import threading
 import time
 import uuid
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 
 from bm25_index import PersistentBM25Index
+from database_store import (
+    DatabaseRuntimeConfig,
+    database_source_name,
+    fetch_product_types_by_ids,
+    fetch_products_by_ids,
+)
 from gemini_client import last_gemini_metrics
-from mysql_store import fetch_products_by_ids, mysql_source_name
 from ollama_client import last_ollama_embedding_metrics
 from query_planner import (
     build_query_filter_catalog,
+    default_query_plan,
     deterministic_filter_query_plan,
     enrich_query_plan,
     extract_query_plan,
@@ -33,6 +41,8 @@ from settings import (
     HYBRID_CANDIDATE_K,
     UNPRICED_RENTAL_FEE_CEILING,
     MYSQL_RESULT_ID_COLUMN,
+    MYSQL_SEARCH_ID_COLUMN,
+    MYSQL_TABLE,
     PRIMARY_RANKED_K,
     QUERY_DETERMINISTIC_FAST_PATH,
     QUERY_EXTRACT_MODELS,
@@ -76,20 +86,45 @@ class ProductSearchEngine:
         embedding_provider=None,
         ranker=None,
         shared_plan_cache=None,
+        company_id: str | None = None,
+        mysql_config: DatabaseRuntimeConfig | None = None,
+        shared_reranker=None,
+        close_bm25_index: bool = False,
+        planner_enabled: bool = True,
+        planner_prompt_context: str = "",
     ):
         self.collection = collection or load_collection()
-        self._owns_bm25_index = bm25_index is None
+        self._owns_bm25_index = bm25_index is None or close_bm25_index
         self.bm25_index = bm25_index or PersistentBM25Index()
         self.query_provider = query_provider
         self.embedding_provider = embedding_provider
-        self.ranker = ranker
+        self.ranker = ranker or getattr(shared_reranker, "ranker", None)
         self.shared_plan_cache = shared_plan_cache
-        self.source_name = mysql_source_name()
+        self.shared_reranker = shared_reranker
+        self.company_id = company_id
+        self.planner_enabled = planner_enabled
+        self.planner_prompt_context = planner_prompt_context
+        self.mysql_config = mysql_config
+        self.source_name = database_source_name(mysql_config)
+        self.search_table = (
+            mysql_config.search_table if mysql_config is not None else MYSQL_TABLE
+        )
+        self.search_id_column = (
+            mysql_config.search_id_column
+            if mysql_config is not None
+            else MYSQL_SEARCH_ID_COLUMN
+        )
+        self.result_id_column = (
+            mysql_config.result_id_column
+            if mysql_config is not None
+            else MYSQL_RESULT_ID_COLUMN
+        )
         self.filter_value_index = query_filter_value_index(self.bm25_index)
         self.filter_catalog = build_query_filter_catalog(self.filter_value_index)
         self._query_plan_cache: OrderedDict[str, tuple[float, dict]] = (
             OrderedDict()
         )
+        self._plan_cache_lock = threading.RLock()
 
     def close(self) -> None:
         if self._owns_bm25_index:
@@ -101,6 +136,22 @@ class ProductSearchEngine:
 
     def set_shared_plan_cache(self, cache) -> None:
         self.shared_plan_cache = cache
+
+    def _cache_namespace(self, name: str) -> str:
+        return f"{self.company_id}:{name}" if self.company_id else name
+
+    def _fetch_products(self, product_ids) -> list[dict]:
+        if self.mysql_config is None:
+            return fetch_products_by_ids(product_ids)
+        return fetch_products_by_ids(product_ids, config=self.mysql_config)
+
+    def _fetch_product_types(self, product_ids) -> dict[str, str]:
+        if self.mysql_config is None:
+            return fetch_product_types_by_ids(product_ids)
+        return fetch_product_types_by_ids(
+            product_ids,
+            config=self.mysql_config,
+        )
 
     def plan_cache_health(self) -> dict:
         if self.shared_plan_cache is None:
@@ -128,6 +179,7 @@ class ProductSearchEngine:
     def _result_cache_key(self, query: str, limit: int | None) -> str:
         version_parts = (
             RESULT_CACHE_SCHEMA_VERSION,
+            self.company_id or "legacy",
             str(self.bm25_index.revision()),
             str(self.bm25_index.count()),
             str(limit),
@@ -149,7 +201,7 @@ class ProductSearchEngine:
         started = time.perf_counter()
         cache_key = self._result_cache_key(query, limit)
         cached = self.shared_plan_cache.get_json(
-            "search_result",
+            self._cache_namespace("search_result"),
             cache_key,
         )
         if cached is None:
@@ -177,8 +229,8 @@ class ProductSearchEngine:
             )
             return None
 
-        mysql_started = time.perf_counter()
-        products = fetch_products_by_ids(cached["product_ids"])
+        database_started = time.perf_counter()
+        products = self._fetch_products(cached["product_ids"])
         primary_identities = {
             str(product_id)
             for product_id in cached["primary_product_ids"]
@@ -195,7 +247,7 @@ class ProductSearchEngine:
                     if deterministic
                     else (
                         "ranked"
-                        if str(product.get(MYSQL_RESULT_ID_COLUMN))
+                        if str(product.get(self.result_id_column))
                         in primary_identities
                         else "related"
                     )
@@ -206,11 +258,11 @@ class ProductSearchEngine:
         elapsed = time.perf_counter() - started
         LOGGER.info(
             "[search:%s] step=result_cache status=hit ids=%d rows=%d "
-            "mysql_ms=%.0f duration_ms=%.0f",
+            "database_ms=%.0f duration_ms=%.0f",
             trace_id,
             len(cached["product_ids"]),
             len(products),
-            (time.perf_counter() - mysql_started) * 1000,
+            (time.perf_counter() - database_started) * 1000,
             elapsed * 1000,
         )
         return {
@@ -229,6 +281,8 @@ class ProductSearchEngine:
             "reranked": [],
             "reranker_load_seconds": 0.0,
             "reranker_seconds": 0.0,
+            "reranker_provider": cached.get("reranker_provider", "cache"),
+            "reranker_attempts": [],
             "related_tail_seconds": 0.0,
             "primary_product_ids": cached["primary_product_ids"],
             "related_product_ids": cached["related_product_ids"],
@@ -266,9 +320,10 @@ class ProductSearchEngine:
                 str(product_id)
                 for product_id in result.get("related_product_ids", [])
             ],
+            "reranker_provider": result.get("reranker_provider", "none"),
         }
         self.shared_plan_cache.set_json(
-            "search_result",
+            self._cache_namespace("search_result"),
             self._result_cache_key(query, limit),
             payload,
             RESULT_CACHE_TTL_SECONDS,
@@ -278,30 +333,35 @@ class ProductSearchEngine:
         if QUERY_PLAN_CACHE_SIZE <= 0 or QUERY_PLAN_CACHE_TTL_SECONDS <= 0:
             return None
         key = self._query_cache_key(query)
-        cached = self._query_plan_cache.get(key)
-        if cached is not None:
-            expires_at, result = cached
-            if expires_at > time.monotonic():
-                self._query_plan_cache.move_to_end(key)
-                return deepcopy(result)
-            del self._query_plan_cache[key]
+        with self._plan_cache_lock:
+            cached = self._query_plan_cache.get(key)
+            if cached is not None:
+                expires_at, result = cached
+                if expires_at > time.monotonic():
+                    self._query_plan_cache.move_to_end(key)
+                    return deepcopy(result)
+                del self._query_plan_cache[key]
         if self.shared_plan_cache is None:
             return None
         shared_key = hashlib.sha256(key.encode("utf-8")).hexdigest()
-        result = self.shared_plan_cache.get_json("query_plan", shared_key)
+        result = self.shared_plan_cache.get_json(
+            self._cache_namespace("query_plan"),
+            shared_key,
+        )
         if result is None:
             return None
         self._cache_memory_plan(key, result)
         return deepcopy(result)
 
     def _cache_memory_plan(self, key: str, result: dict) -> None:
-        self._query_plan_cache[key] = (
-            time.monotonic() + QUERY_PLAN_CACHE_TTL_SECONDS,
-            deepcopy(result),
-        )
-        self._query_plan_cache.move_to_end(key)
-        while len(self._query_plan_cache) > QUERY_PLAN_CACHE_SIZE:
-            self._query_plan_cache.popitem(last=False)
+        with self._plan_cache_lock:
+            self._query_plan_cache[key] = (
+                time.monotonic() + QUERY_PLAN_CACHE_TTL_SECONDS,
+                deepcopy(result),
+            )
+            self._query_plan_cache.move_to_end(key)
+            while len(self._query_plan_cache) > QUERY_PLAN_CACHE_SIZE:
+                self._query_plan_cache.popitem(last=False)
 
     def _cache_plan(self, query: str, result: dict) -> None:
         if QUERY_PLAN_CACHE_SIZE <= 0 or QUERY_PLAN_CACHE_TTL_SECONDS <= 0:
@@ -311,7 +371,7 @@ class ProductSearchEngine:
         if self.shared_plan_cache is not None:
             shared_key = hashlib.sha256(key.encode("utf-8")).hexdigest()
             self.shared_plan_cache.set_json(
-                "query_plan",
+                self._cache_namespace("query_plan"),
                 shared_key,
                 result,
                 QUERY_PLAN_CACHE_TTL_SECONDS,
@@ -352,10 +412,15 @@ class ProductSearchEngine:
                     elapsed * 1000,
                 )
                 return cached
-            query_plan = extract_query_plan(
-                query,
-                self.filter_catalog,
-                query_provider=self.query_provider,
+            query_plan = (
+                extract_query_plan(
+                    query,
+                    self.filter_catalog,
+                    query_provider=self.query_provider,
+                    prompt_context=self.planner_prompt_context,
+                )
+                if self.planner_enabled
+                else default_query_plan(query)
             )
             query_plan = enrich_query_plan(
                 query,
@@ -370,6 +435,7 @@ class ProductSearchEngine:
         query_metrics = (
             last_gemini_metrics()
             if self.query_provider is None
+            and self.planner_enabled
             and query_plan["execution_path"] == "semantic"
             else {}
         )
@@ -387,7 +453,11 @@ class ProductSearchEngine:
             model_label = "none"
             attempted_label = "none"
         elif not model_label:
-            model_label = type(self.query_provider).__name__
+            model_label = (
+                type(self.query_provider).__name__
+                if self.planner_enabled
+                else "disabled"
+            )
             attempted_label = attempted_label or "custom"
         log_method(
             "[search:%s] step=plan status=%s path=%s model=%s attempted=%s "
@@ -459,27 +529,39 @@ class ProductSearchEngine:
             ",".join(active_filter_names(resolved_filters)) or "none",
         )
 
-        vector_started = time.perf_counter()
-        vector_results = vector_search(
-            query_plan["semantic_query"],
-            self.collection,
-            vector_top_k,
-            candidate_k=max(VECTOR_CANDIDATE_K, vector_top_k),
-            source_name=self.source_name,
-            resolved_filters=resolved_filters,
-            embedding_provider=self.embedding_provider,
-        )
-        vector_seconds = time.perf_counter() - vector_started
+        def run_vector() -> tuple[list[dict], float]:
+            started = time.perf_counter()
+            results = vector_search(
+                query_plan["semantic_query"],
+                self.collection,
+                vector_top_k,
+                candidate_k=max(VECTOR_CANDIDATE_K, vector_top_k),
+                source_name=self.source_name,
+                resolved_filters=resolved_filters,
+                embedding_provider=self.embedding_provider,
+                company_id=self.company_id,
+            )
+            return results, time.perf_counter() - started
 
-        bm25_started = time.perf_counter()
-        bm25_results = bm25_search(
-            query_plan["keyword_query"],
-            self.bm25_index,
-            self.collection,
-            resolved_filters,
-            bm25_top_k,
-        )
-        bm25_seconds = time.perf_counter() - bm25_started
+        def run_bm25() -> tuple[list[dict], float]:
+            started = time.perf_counter()
+            results = bm25_search(
+                query_plan["keyword_query"],
+                self.bm25_index,
+                self.collection,
+                resolved_filters,
+                bm25_top_k,
+            )
+            return results, time.perf_counter() - started
+
+        with ThreadPoolExecutor(
+            max_workers=2,
+            thread_name_prefix="hybrid-retrieval",
+        ) as executor:
+            vector_future = executor.submit(run_vector)
+            bm25_future = executor.submit(run_bm25)
+            vector_results, vector_seconds = vector_future.result()
+            bm25_results, bm25_seconds = bm25_future.result()
 
         merged = merge_results(
             vector_results,
@@ -492,6 +574,9 @@ class ProductSearchEngine:
         candidates = filter_candidates_by_ad_type(
             merged,
             query_plan["target_ad_type"],
+            type_fetcher=self._fetch_product_types,
+            search_table=self.search_table,
+            search_id_column=self.search_id_column,
         )[:hybrid_top_k]
         LOGGER.info(
             "[search:%s] step=retrieve status=complete vector=%d bm25=%d "
@@ -520,6 +605,9 @@ class ProductSearchEngine:
     def ensure_reranker(self) -> float:
         if self.ranker is not None:
             return 0.0
+        if self.shared_reranker is not None:
+            self.ranker, load_seconds = self.shared_reranker.ensure()
+            return load_seconds
         started = time.perf_counter()
         self.ranker = load_reranker()
         return time.perf_counter() - started
@@ -559,22 +647,32 @@ class ProductSearchEngine:
         LOGGER.info(
             "[search:%s] step=rerank status=start model=%s candidates=%d top_k=%d",
             trace_id,
-            RERANK_MODEL,
+            getattr(self.ranker, "model_label", RERANK_MODEL),
             len(candidates),
             RERANK_TOP_K if top_k is None else top_k,
         )
-        results = rerank(
-            ranking_query,
-            candidates,
-            self.ranker,
-            RERANK_TOP_K if top_k is None else top_k,
-            diversity_top_k=RERANK_TOP_K,
-        )
+        def run_rerank():
+            return rerank(
+                ranking_query,
+                candidates,
+                self.ranker,
+                RERANK_TOP_K if top_k is None else top_k,
+                diversity_top_k=RERANK_TOP_K,
+            )
+
+        if self.shared_reranker is not None:
+            with self.shared_reranker.inference_guard():
+                results = run_rerank()
+        else:
+            results = run_rerank()
         elapsed = time.perf_counter() - started
+        provider = getattr(self.ranker, "last_provider", "local")
+        attempts = list(getattr(self.ranker, "last_attempts", []))
         LOGGER.info(
-            "[search:%s] step=rerank status=complete results=%d "
+            "[search:%s] step=rerank status=complete provider=%s results=%d "
             "load_ms=%.0f duration_ms=%.0f",
             trace_id,
+            provider,
             len(results),
             load_seconds * 1000,
             elapsed * 1000,
@@ -583,6 +681,8 @@ class ProductSearchEngine:
             "results": results,
             "load_seconds": load_seconds,
             "seconds": elapsed,
+            "provider": provider,
+            "attempts": attempts,
         }
 
     def _filtered_search(
@@ -600,6 +700,7 @@ class ProductSearchEngine:
             planned["query_plan"].get("inferred_categories"),
             planned["query_plan"]["target_ad_type"],
             result_limit,
+            type_fetcher=self._fetch_product_types,
             sort_order=planned["query_plan"].get("sort_order"),
         )
         browse_seconds = time.perf_counter() - browse_started
@@ -615,7 +716,7 @@ class ProductSearchEngine:
         )
         products = [
             {**product, "result_tier": "filtered"}
-            for product in fetch_products_by_ids(product_ids)
+            for product in self._fetch_products(product_ids)
         ]
         LOGGER.info(
             "[search:%s] step=search status=complete path=deterministic_filter "
@@ -635,6 +736,8 @@ class ProductSearchEngine:
             "reranked": [],
             "reranker_load_seconds": 0.0,
             "reranker_seconds": 0.0,
+            "reranker_provider": "none",
+            "reranker_attempts": [],
             "related_tail_seconds": browse_seconds,
             "primary_product_ids": [],
             "related_product_ids": product_ids,
@@ -656,6 +759,8 @@ class ProductSearchEngine:
             else None
         )
         trace_id = uuid.uuid4().hex[:8]
+        if self.company_id:
+            trace_id = f"{self.company_id}:{trace_id}"
         started = time.perf_counter()
         LOGGER.info(
             "[search:%s] step=search status=start query_chars=%d limit=%s",
@@ -712,8 +817,18 @@ class ProductSearchEngine:
                 "[search:%s] step=rerank status=skipped reason=no_candidates",
                 trace_id,
             )
-            ranked = {"results": [], "load_seconds": 0.0, "seconds": 0.0}
-        primary_product_ids = extract_product_ids(ranked["results"])
+            ranked = {
+                "results": [],
+                "load_seconds": 0.0,
+                "seconds": 0.0,
+                "provider": "none",
+                "attempts": [],
+            }
+        primary_product_ids = extract_product_ids(
+            ranked["results"],
+            search_table=self.search_table,
+            search_id_column=self.search_id_column,
+        )
         tail_limit = (
             max(limit - len(primary_product_ids), 0)
             if limit is not None
@@ -733,6 +848,7 @@ class ProductSearchEngine:
                     for result in ranked["results"]
                 },
                 exclude_product_ids=set(primary_product_ids),
+                type_fetcher=self._fetch_product_types,
                 sort_order=planned["query_plan"].get("sort_order"),
             )
         related_tail_seconds = time.perf_counter() - tail_started
@@ -751,11 +867,11 @@ class ProductSearchEngine:
             related_tail_seconds * 1000,
         )
         LOGGER.info(
-            "[search:%s] step=mysql_map status=start product_ids=%d",
+            "[search:%s] step=database_map status=start product_ids=%d",
             trace_id,
             len(product_ids),
         )
-        products = fetch_products_by_ids(product_ids)
+        products = self._fetch_products(product_ids)
         primary_identities = {
             str(product_id)
             for product_id in primary_product_ids
@@ -765,7 +881,7 @@ class ProductSearchEngine:
                 **product,
                 "result_tier": (
                     "ranked"
-                    if str(product.get(MYSQL_RESULT_ID_COLUMN))
+                    if str(product.get(self.result_id_column))
                     in primary_identities
                     else "related"
                 ),
@@ -787,12 +903,12 @@ class ProductSearchEngine:
 
             products.sort(key=price_key)
             product_ids = [
-                product[MYSQL_RESULT_ID_COLUMN]
+                product[self.result_id_column]
                 for product in products
-                if product.get(MYSQL_RESULT_ID_COLUMN) is not None
+                if product.get(self.result_id_column) is not None
             ]
         LOGGER.info(
-            "[search:%s] step=mysql_map status=complete rows=%d",
+            "[search:%s] step=database_map status=complete rows=%d",
             trace_id,
             len(products),
         )
@@ -808,6 +924,8 @@ class ProductSearchEngine:
             "reranked": ranked["results"],
             "reranker_load_seconds": ranked["load_seconds"],
             "reranker_seconds": ranked["seconds"],
+            "reranker_provider": ranked["provider"],
+            "reranker_attempts": ranked["attempts"],
             "related_tail_seconds": related_tail_seconds,
             "primary_product_ids": primary_product_ids,
             "related_product_ids": related_product_ids,

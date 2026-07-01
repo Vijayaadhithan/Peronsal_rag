@@ -10,7 +10,11 @@ from typing import Any
 
 from pypdf import PdfReader
 
-from mysql_store import mysql_source_name
+from database_store import (
+    DatabaseRuntimeConfig,
+    database_backend,
+    database_source_name,
+)
 from settings import (
     CHUNK_OVERLAP,
     CHUNK_SIZE,
@@ -188,8 +192,20 @@ def chunk_id(filename: str, location: int | str, index: int) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
-def mysql_document_id(table: str, row_identity: Any) -> str:
-    value = f"mysql\0{MYSQL_DATABASE}\0{table}\0{row_identity}".encode()
+def mysql_document_id(
+    table: str,
+    row_identity: Any,
+    *,
+    database: str = MYSQL_DATABASE,
+    company_id: str | None = None,
+    backend: str = "mysql",
+) -> str:
+    if company_id is None:
+        value = f"{backend}\0{database}\0{table}\0{row_identity}".encode()
+    else:
+        value = (
+            f"{backend}\0{company_id}\0{database}\0{table}\0{row_identity}"
+        ).encode()
     return hashlib.sha256(value).hexdigest()
 
 
@@ -366,20 +382,27 @@ def prepare_mysql_row(
     row: dict[str, Any],
     content_column: str,
     primary_key_column: str | None,
+    *,
+    mysql_config: DatabaseRuntimeConfig | None = None,
+    company_id: str | None = None,
 ) -> tuple[str, str, dict] | None:
     document, content_metadata = prepare_content_document(row.get(content_column))
     if not document:
         return None
 
+    database = mysql_config.database if mysql_config else MYSQL_DATABASE
+    search_table = mysql_config.search_table if mysql_config else MYSQL_TABLE
     identity = mysql_row_identity(row, primary_key_column)
     metadata = {
-        "source_file": mysql_source_name(),
-        "source_type": "mysql",
-        "source_database": MYSQL_DATABASE,
-        "source_table": MYSQL_TABLE,
+        "source_file": database_source_name(mysql_config),
+        "source_type": database_backend(mysql_config),
+        "source_database": database,
+        "source_table": search_table,
         "embedding_model": EMBED_MODEL,
         "source_content_hash": content_hash(document),
     }
+    if company_id is not None:
+        metadata["company_id"] = company_id
     metadata.update(content_metadata)
     if primary_key_column and row.get(primary_key_column) is not None:
         metadata["primary_key_column"] = primary_key_column
@@ -392,20 +415,40 @@ def prepare_mysql_row(
         if safe_value is not None:
             metadata[column] = safe_value
 
-    return mysql_document_id(MYSQL_TABLE, identity), document, metadata
+    return (
+        mysql_document_id(
+            search_table,
+            identity,
+            database=database,
+            company_id=company_id,
+            backend=database_backend(mysql_config),
+        ),
+        document,
+        metadata,
+    )
 
 
 def prepare_bm25_index_row(
     row: dict[str, Any],
     content_column: str,
     primary_key_column: str | None,
+    *,
+    mysql_config: DatabaseRuntimeConfig | None = None,
+    company_id: str | None = None,
 ) -> dict | None:
     content = cell_to_text(row.get(content_column))
     if not content:
         return None
 
+    database = mysql_config.database if mysql_config else MYSQL_DATABASE
+    search_table = mysql_config.search_table if mysql_config else MYSQL_TABLE
+    search_id_column = (
+        mysql_config.search_id_column
+        if mysql_config
+        else MYSQL_SEARCH_ID_COLUMN
+    )
     identity = mysql_row_identity(row, primary_key_column)
-    product_id = row.get(MYSQL_SEARCH_ID_COLUMN)
+    product_id = row.get(search_id_column)
     if product_id is None:
         product_id = identity
 
@@ -414,7 +457,13 @@ def prepare_bm25_index_row(
         rental_fee = None
 
     return {
-        "doc_id": mysql_document_id(MYSQL_TABLE, identity),
+        "doc_id": mysql_document_id(
+            search_table,
+            identity,
+            database=database,
+            company_id=company_id,
+            backend=database_backend(mysql_config),
+        ),
         "product_id": product_id,
         "content": content,
         "main_category_name": metadata_value(row.get("main_category_name")),

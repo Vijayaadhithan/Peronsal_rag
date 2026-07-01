@@ -5,28 +5,41 @@ import chromadb
 from settings import CHROMA_DIR, COLLECTION_NAME, EMBED_MODEL
 
 
-def get_collection(create: bool = False):
-    client = chromadb.PersistentClient(path=str(CHROMA_DIR))
+def get_collection(
+    create: bool = False,
+    *,
+    chroma_dir=CHROMA_DIR,
+    collection_name=COLLECTION_NAME,
+):
+    client = chromadb.PersistentClient(path=str(chroma_dir))
     if create:
         collection = client.get_or_create_collection(
-            name=COLLECTION_NAME,
+            name=collection_name,
             metadata={"hnsw:space": "cosine"},
         )
         return client, collection
     try:
-        return client, client.get_collection(COLLECTION_NAME)
+        return client, client.get_collection(collection_name)
     except Exception as exc:
         raise RuntimeError(
-            "No vector collection found. Run: python src/ingest.py"
+            f"No vector collection {collection_name!r} found. Run the "
+            "tenant ingestion job first."
         ) from exc
 
 
-def list_indexed_documents() -> None:
-    _, collection = get_collection()
+def list_indexed_documents(
+    *,
+    chroma_dir=CHROMA_DIR,
+    collection_name=COLLECTION_NAME,
+) -> None:
+    _, collection = get_collection(
+        chroma_dir=chroma_dir,
+        collection_name=collection_name,
+    )
     data = collection.get(include=["metadatas"])
     counts = Counter(metadata["source_file"] for metadata in data["metadatas"])
 
-    print(f"Collection: {COLLECTION_NAME} ({collection.count()} chunks)\n")
+    print(f"Collection: {collection_name} ({collection.count()} chunks)\n")
     for filename, count in sorted(counts.items(), key=lambda item: item[0].lower()):
         print(f"{count:>5} chunks  {filename}")
 
@@ -35,8 +48,17 @@ def confirm(message: str, assume_yes: bool = False) -> bool:
     return assume_yes or input(f"{message} [y/N]: ").strip().lower() in {"y", "yes"}
 
 
-def delete_indexed_document(filename: str, assume_yes: bool = False) -> None:
-    _, collection = get_collection()
+def delete_indexed_document(
+    filename: str,
+    assume_yes: bool = False,
+    *,
+    chroma_dir=CHROMA_DIR,
+    collection_name=COLLECTION_NAME,
+) -> None:
+    _, collection = get_collection(
+        chroma_dir=chroma_dir,
+        collection_name=collection_name,
+    )
     existing = collection.get(where={"source_file": filename}, include=[])
     count = len(existing["ids"])
     if not count:
@@ -51,17 +73,25 @@ def delete_indexed_document(filename: str, assume_yes: bool = False) -> None:
     print(f"Deleted {count} chunks for '{filename}'.")
 
 
-def clear_collection(assume_yes: bool = False) -> None:
-    client, collection = get_collection()
+def clear_collection(
+    assume_yes: bool = False,
+    *,
+    chroma_dir=CHROMA_DIR,
+    collection_name=COLLECTION_NAME,
+) -> None:
+    client, collection = get_collection(
+        chroma_dir=chroma_dir,
+        collection_name=collection_name,
+    )
     count = collection.count()
     if not confirm(
-        f"Delete the entire '{COLLECTION_NAME}' collection ({count} chunks)?",
+        f"Delete the entire '{collection_name}' collection ({count} chunks)?",
         assume_yes,
     ):
         print("Cancelled.")
         return
-    client.delete_collection(COLLECTION_NAME)
-    print(f"Deleted collection '{COLLECTION_NAME}'. Source files were kept.")
+    client.delete_collection(collection_name)
+    print(f"Deleted collection '{collection_name}'. Source files were kept.")
 
 
 def source_is_current(

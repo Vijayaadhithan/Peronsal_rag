@@ -1,4 +1,5 @@
 import logging
+import threading
 import time
 from urllib.parse import quote
 
@@ -43,7 +44,15 @@ class GeminiProvider:
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.timeout_seconds = timeout_seconds
-        self.last_chat_metrics: dict[str, float | str | list[str]] = {}
+        self._state = threading.local()
+
+    @property
+    def last_chat_metrics(self) -> dict[str, object]:
+        return getattr(self._state, "last_chat_metrics", {})
+
+    @last_chat_metrics.setter
+    def last_chat_metrics(self, value: dict[str, object]) -> None:
+        self._state.last_chat_metrics = value
 
     def structured_chat(
         self,
@@ -59,6 +68,10 @@ class GeminiProvider:
             )
 
         started = time.perf_counter()
+        metrics: dict[str, float | int | str | list] = {
+            "load_ms": 0.0,
+            "model": model,
+        }
         try:
             response = requests.post(
                 (
@@ -89,6 +102,23 @@ class GeminiProvider:
             )
             response.raise_for_status()
             payload = response.json()
+            usage = payload.get("usageMetadata") or {}
+            metrics.update(
+                {
+                    "input_tokens": int(
+                        usage.get("promptTokenCount", 0) or 0
+                    ),
+                    "output_tokens": int(
+                        usage.get("candidatesTokenCount", 0) or 0
+                    ),
+                    "thought_tokens": int(
+                        usage.get("thoughtsTokenCount", 0) or 0
+                    ),
+                    "total_tokens": int(
+                        usage.get("totalTokenCount", 0) or 0
+                    ),
+                }
+            )
             content = payload["candidates"][0]["content"]
             text = "".join(
                 part.get("text", "")
@@ -134,11 +164,8 @@ class GeminiProvider:
                 f"'{model}'."
             ) from exc
         finally:
-            self.last_chat_metrics = {
-                "total_ms": (time.perf_counter() - started) * 1000,
-                "load_ms": 0.0,
-                "model": model,
-            }
+            metrics["total_ms"] = (time.perf_counter() - started) * 1000
+            self.last_chat_metrics = metrics
 
 
 DEFAULT_GEMINI_PROVIDER = GeminiProvider()
@@ -168,6 +195,7 @@ def structured_chat(
         else (model,)
     )
     attempted_models = []
+    attempts = []
     started = time.perf_counter()
     last_error = None
     for position, candidate_model in enumerate(models, start=1):
@@ -190,6 +218,13 @@ def structured_chat(
                 {
                     "total_ms": (time.perf_counter() - started) * 1000,
                     "attempted_models": attempted_models,
+                    "attempts": attempts
+                    + [
+                        {
+                            **DEFAULT_GEMINI_PROVIDER.last_chat_metrics,
+                            "status": "success",
+                        }
+                    ],
                 }
             )
             LOGGER.info(
@@ -200,10 +235,18 @@ def structured_chat(
             return content
         except GeminiModelUnavailableError as exc:
             last_error = exc
+            attempts.append(
+                {
+                    **DEFAULT_GEMINI_PROVIDER.last_chat_metrics,
+                    "status": "fallback",
+                    "reason": exc.reason,
+                }
+            )
             DEFAULT_GEMINI_PROVIDER.last_chat_metrics.update(
                 {
                     "total_ms": (time.perf_counter() - started) * 1000,
                     "attempted_models": list(attempted_models),
+                    "attempts": list(attempts),
                     "failure_reason": exc.reason,
                 }
             )
@@ -229,5 +272,5 @@ def structured_chat(
     ) from last_error
 
 
-def last_gemini_metrics() -> dict[str, float | str | list[str]]:
+def last_gemini_metrics() -> dict[str, object]:
     return dict(DEFAULT_GEMINI_PROVIDER.last_chat_metrics)

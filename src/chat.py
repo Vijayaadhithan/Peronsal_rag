@@ -1,5 +1,12 @@
+import argparse
 import json
 
+from api import (
+    PUBLIC_PRODUCT_FIELDS,
+    product_is_visible,
+    public_product,
+)
+from bm25_index import PersistentBM25Index
 from mysql_store import (
     fetch_product_types_by_ids,
     fetch_products_by_ids,
@@ -41,24 +48,127 @@ from settings import (
     QUERY_EXTRACT_MODEL,
     RERANK_MODEL,
 )
+from tenant_config import discover_tenant_profiles
+from vector_store import get_tenant_vector_collection
+
+
+def build_engine(company: str | None = None) -> ProductSearchEngine:
+    if company is None:
+        engine = ProductSearchEngine()
+        engine.chat_public_fields = PUBLIC_PRODUCT_FIELDS
+        engine.chat_field_mapping = {}
+        return engine
+    profiles = discover_tenant_profiles()
+    try:
+        profile = profiles[company]
+    except KeyError as exc:
+        available = ", ".join(sorted(profiles)) or "none"
+        raise RuntimeError(
+            f"Unknown company {company!r}; available: {available}"
+        ) from exc
+    engine = ProductSearchEngine(
+        collection=get_tenant_vector_collection(profile),
+        bm25_index=PersistentBM25Index(profile.storage.bm25_path),
+        company_id=profile.company_id,
+        mysql_config=profile.database,
+        close_bm25_index=True,
+    )
+    engine.chat_public_fields = profile.payload.public_fields
+    engine.chat_field_mapping = profile.payload.field_mapping
+    return engine
+
+
+def print_search_result(result: dict, engine: ProductSearchEngine) -> None:
+    query_plan = result["query_plan"]
+    visible_plan = {
+        key: value
+        for key, value in query_plan.items()
+        if key != "fallback_reason"
+    }
+    print(
+        "Query plan: "
+        f"{json.dumps(visible_plan, ensure_ascii=False)}"
+    )
+    if result["unresolved_filters"]:
+        print(
+            "Unresolved filters: "
+            f"{json.dumps(result['unresolved_filters'], ensure_ascii=False)}"
+        )
+    print(
+        "Timings: "
+        f"plan={result.get('seconds', 0):.3f}s "
+        f"vector={result.get('vector_seconds', 0):.3f}s "
+        f"bm25={result.get('bm25_seconds', 0):.3f}s "
+        f"rerank={result.get('reranker_seconds', 0):.3f}s "
+        f"provider={result.get('reranker_provider', 'none')}"
+    )
+    products = [
+        public_product(
+            product,
+            fields=engine.chat_public_fields,
+            field_mapping=engine.chat_field_mapping,
+        )
+        for product in result["products"]
+        if product_is_visible(product)
+    ]
+    print(
+        json.dumps(
+            products,
+            ensure_ascii=False,
+            indent=2,
+            default=str,
+        )
+    )
 
 
 def main():
-    print("Opening Chroma collection...", flush=True)
-    engine = ProductSearchEngine()
+    parser = argparse.ArgumentParser(
+        description="Run one search or open the interactive search shell."
+    )
+    parser.add_argument(
+        "--company",
+        help="tenant profile slug; omit to use the legacy local indexes",
+    )
+    parser.add_argument(
+        "--query",
+        help="run one query and exit instead of opening the interactive shell",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=10,
+        help="maximum results for one-shot or interactive searches",
+    )
+    args = parser.parse_args()
+    if args.limit <= 0:
+        raise RuntimeError("--limit must be greater than zero.")
+
+    backend_label = f"company {args.company}" if args.company else "local"
+    print(f"Opening {backend_label} search indexes...", flush=True)
+    engine = build_engine(args.company)
     bm25_count = engine.bm25_index.count()
     if not bm25_count:
+        command = (
+            f"python src/ingest.py --company {args.company} --mysql-bm25-only"
+            if args.company
+            else "python src/ingest.py --mysql-bm25-only"
+        )
         print(
             "No persistent BM25 product index found. Run: "
-            "python src/ingest.py --mysql-bm25-only"
+            + command
         )
         engine.close()
         return
 
     print(f"Opened BM25 index with {bm25_count} products.", flush=True)
-    print(f"\n{APP_NAME} semantic product search ready. Type 'exit' to quit.\n")
+    print(f"\n{APP_NAME} semantic product search ready.", flush=True)
 
     try:
+        if args.query:
+            result = engine.search(args.query, limit=args.limit)
+            print_search_result(result, engine)
+            return
+        print("Type 'exit' to quit.\n")
         while True:
             question = input("Ask: ").strip()
             if question.lower() in ["exit", "quit"]:
@@ -66,80 +176,8 @@ def main():
             if not question:
                 continue
 
-            print(
-                f"Extracting search intent with {QUERY_EXTRACT_MODEL}...",
-                end="",
-                flush=True,
-            )
-            planned = engine.plan(question)
-            query_plan = planned["query_plan"]
-            print(f" done ({planned['seconds']:.2f}s).", flush=True)
-            if query_plan["fallback_reason"]:
-                print(
-                    "Query extraction failed; using the original query for vector and "
-                    f"BM25 search. Reason: {query_plan['fallback_reason']}"
-                )
-
-            unresolved_filters = planned["unresolved_filters"]
-            if unresolved_filters:
-                print(
-                    "Ignoring filters that do not exactly match indexed values: "
-                    f"{json.dumps(unresolved_filters, ensure_ascii=False)}"
-                )
-
-            visible_plan = {
-                key: value
-                for key, value in query_plan.items()
-                if key != "fallback_reason"
-            }
-            print(
-                "Query plan: "
-                f"{json.dumps(visible_plan, ensure_ascii=False)}"
-            )
-            print("Searching...", end="", flush=True)
-            retrieved = engine.retrieve(
-                query_plan,
-                planned["resolved_filters"],
-            )
-            merged = retrieved["candidates"]
-            if not merged:
-                target_label = (
-                    "wanted ads"
-                    if query_plan["target_ad_type"] == "wanted"
-                    else "offer ads"
-                )
-                print(
-                    f" done.\n\nNo matching {target_label} found after applying "
-                    "the requested filters.\n"
-                )
-                print("-" * 80 + "\n")
-                continue
-
-            if engine.ranker is None:
-                print(f" loading {RERANK_MODEL}...", end="", flush=True)
-                load_seconds = engine.ensure_reranker()
-                print(
-                    f" loaded ({load_seconds:.2f}s)...",
-                    end="",
-                    flush=True,
-                )
-            ranked = engine.rank(question, merged, query_plan)
-            reranked = ranked["results"]
-            print(
-                " done "
-                f"(vector {retrieved['vector_seconds']:.2f}s, "
-                f"BM25 {retrieved['bm25_seconds']:.3f}s, "
-                f"rerank {ranked['seconds']:.2f}s).",
-                flush=True,
-            )
-
-            product_ids = extract_product_ids(reranked)
-            products = fetch_products_by_ids(product_ids)
-            print(
-                f"\nProducts from {MYSQL_DATABASE}.{MYSQL_RESULT_TABLE} "
-                f"({len(products)} rows):\n"
-            )
-            print(json.dumps(products, ensure_ascii=False, indent=2, default=str))
+            result = engine.search(question, limit=args.limit)
+            print_search_result(result, engine)
             print("\n" + "-" * 80 + "\n")
     finally:
         engine.close()

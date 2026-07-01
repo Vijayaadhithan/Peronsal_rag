@@ -1,0 +1,77 @@
+company:
+  # Copy this file to configs/tenants/acme.yaml and make the ID match the
+  # filename exactly.
+  id: acme
+  planner_adapter: gainr
+
+planner:
+  # Disable only the hosted LLM planner; deterministic filters and semantic
+  # retrieval still work with the original query.
+  enabled: true
+  prompt_context: >-
+    Acme is an equipment-rental marketplace. The public payload calls the
+    rental fee "price". Only extract filters represented by this company's
+    canonical adapter.
+
+api:
+  # Produces /api/v1/acme/search and /api/v1/acme/health.
+  endpoint_slug: acme
+  key_envs:
+    - ACME_API_KEY
+
+database:
+  backend: postgres
+  host_env: ACME_POSTGRES_HOST
+  port_env: ACME_POSTGRES_PORT
+  database_env: ACME_POSTGRES_DATABASE
+  user_env: ACME_POSTGRES_USER
+  password_env: ACME_POSTGRES_PASSWORD
+  schema: public
+  search_ready_table: catalog_search_ready
+  content_column: embedding_content
+  bm25_column: bm25_content
+  search_id_column: product_id
+  result_table: products
+  result_id_column: product_id
+  # Canonical offer/wanted intent column: 1=offer, 2=wanted.
+  result_type_column: listing_type
+
+storage:
+  vector_backend: pgvector
+  vector_dimensions: 768
+  pgvector:
+    use_company_database: true
+    schema: public
+    table: acme_search_vectors
+  chroma_dir: storage/chroma
+  collection_name: company_acme
+  bm25_path: storage/companies/acme/bm25.sqlite3
+
+payload:
+  # Company clients can use different request field names while the internal
+  # search contract remains query/cursor/page_size.
+  request_mapping:
+    query: search_text
+    cursor: continuation_token
+    page_size: limit
+  # These are public API names. field_mapping maps a public name to the
+  # company result-table column that supplies it.
+  public_fields:
+    - result_tier
+    - product_id
+    - name
+    - summary
+    - price
+    - brand
+  field_mapping:
+    name: product_name
+    summary: product_description
+    price: sale_price
+  filter_schema:
+    main_category_name: keyword
+    subcategory_name: keyword
+    rental_fee: number
+
+rate_limit:
+  requests_per_minute: 60
+  burst: 10

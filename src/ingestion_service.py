@@ -3,17 +3,18 @@ from pathlib import Path
 
 from bm25_index import PersistentBM25Index
 from chroma_store import get_collection, mysql_current_ids, source_is_current
+from database_store import (
+    count_database_rows,
+    database_backend,
+    database_source_name,
+    detect_database_primary_key,
+    fetch_database_columns,
+    iter_database_rows,
+)
 from document_processing import (
     prepare_bm25_index_row,
     prepare_mysql_row,
     prepare_source,
-)
-from mysql_store import (
-    count_mysql_rows,
-    detect_mysql_primary_key,
-    fetch_mysql_columns,
-    iter_mysql_rows,
-    mysql_source_name,
 )
 from ollama_client import embed_texts
 from settings import (
@@ -23,6 +24,8 @@ from settings import (
     MYSQL_DATABASE,
     MYSQL_TABLE,
 )
+from tenant_config import TenantProfile
+from vector_store import get_tenant_vector_collection
 
 EMBED_BATCH_SIZE = 32
 MYSQL_BATCH_SIZE = 500
@@ -55,22 +58,35 @@ def check_sources(source_files: list[Path]) -> bool:
 def check_mysql_source(
     limit: int | None = None,
     primary_key_column: str | None = None,
+    tenant: TenantProfile | None = None,
 ) -> bool:
-    columns = fetch_mysql_columns()
-    if MYSQL_CONTENT_COLUMN not in columns:
+    mysql_config = tenant.database if tenant else None
+    content_column = (
+        mysql_config.content_column if mysql_config else MYSQL_CONTENT_COLUMN
+    )
+    database = mysql_config.database if mysql_config else MYSQL_DATABASE
+    table = mysql_config.search_table if mysql_config else MYSQL_TABLE
+    columns = fetch_database_columns(mysql_config)
+    if content_column not in columns:
         print(
-            f"ERROR: column '{MYSQL_CONTENT_COLUMN}' was not found in "
-            f"{MYSQL_DATABASE}.{MYSQL_TABLE}."
+            f"ERROR: column '{content_column}' was not found in "
+            f"{database}.{table}."
         )
         print(f"Available columns: {', '.join(columns)}")
         return False
 
-    detected_primary_key = detect_mysql_primary_key(columns, primary_key_column)
-    row_count = count_mysql_rows(MYSQL_CONTENT_COLUMN)
+    detected_primary_key = detect_database_primary_key(
+        columns,
+        primary_key_column,
+        mysql_config,
+    )
+    row_count = count_database_rows(content_column, mysql_config)
     planned_rows = min(row_count, limit) if limit is not None else row_count
 
-    print(f"OK: MySQL table {MYSQL_DATABASE}.{MYSQL_TABLE}")
-    print(f"Content column: {MYSQL_CONTENT_COLUMN}")
+    print(f"OK: {database_backend(mysql_config)} table {database}.{table}")
+    if tenant:
+        print(f"Company: {tenant.company_id}")
+    print(f"Content column: {content_column}")
     print(f"Primary key column: {detected_primary_key or 'none detected'}")
     print(f"Rows with embedding text: {row_count}")
     print(f"Rows planned for ingestion: {planned_rows}")
@@ -160,6 +176,7 @@ def ingest_mysql_source(
     primary_key_column: str | None = None,
     replace_source: bool = False,
     force_reembed: bool = False,
+    tenant: TenantProfile | None = None,
 ) -> None:
     if batch_size <= 0:
         raise RuntimeError("--mysql-batch-size must be greater than zero.")
@@ -168,26 +185,51 @@ def ingest_mysql_source(
     if limit is not None and limit <= 0:
         raise RuntimeError("--limit must be greater than zero.")
 
-    columns = fetch_mysql_columns()
-    if MYSQL_CONTENT_COLUMN not in columns:
-        raise RuntimeError(
-            f"Column '{MYSQL_CONTENT_COLUMN}' was not found in "
-            f"{MYSQL_DATABASE}.{MYSQL_TABLE}."
-        )
-    detected_primary_key = detect_mysql_primary_key(columns, primary_key_column)
-    bm25_column = (
-        MYSQL_BM25_COLUMN if MYSQL_BM25_COLUMN in columns else MYSQL_CONTENT_COLUMN
+    mysql_config = tenant.database if tenant else None
+    content_column = (
+        mysql_config.content_column if mysql_config else MYSQL_CONTENT_COLUMN
     )
-    row_count = count_mysql_rows(MYSQL_CONTENT_COLUMN)
+    database = mysql_config.database if mysql_config else MYSQL_DATABASE
+    table = mysql_config.search_table if mysql_config else MYSQL_TABLE
+    columns = fetch_database_columns(mysql_config)
+    if content_column not in columns:
+        raise RuntimeError(
+            f"Column '{content_column}' was not found in "
+            f"{database}.{table}."
+        )
+    detected_primary_key = detect_database_primary_key(
+        columns,
+        primary_key_column,
+        mysql_config,
+    )
+    bm25_column = (
+        mysql_config.bm25_column
+        if mysql_config and mysql_config.bm25_column in columns
+        else (
+            MYSQL_BM25_COLUMN
+            if MYSQL_BM25_COLUMN in columns
+            else content_column
+        )
+    )
+    row_count = count_database_rows(content_column, mysql_config)
     planned_rows = min(row_count, limit) if limit is not None else row_count
 
-    CHROMA_DIR.mkdir(parents=True, exist_ok=True)
-    _, collection = get_collection(create=True)
-    bm25_index = PersistentBM25Index()
-    source_name = mysql_source_name()
+    if tenant:
+        if tenant.storage.vector_backend == "chroma":
+            tenant.storage.chroma_dir.mkdir(parents=True, exist_ok=True)
+        collection = get_tenant_vector_collection(tenant, create=True)
+    else:
+        CHROMA_DIR.mkdir(parents=True, exist_ok=True)
+        _, collection = get_collection(create=True)
+    bm25_index = PersistentBM25Index(
+        tenant.storage.bm25_path if tenant else None
+    ) if tenant else PersistentBM25Index()
+    source_name = database_source_name(mysql_config)
 
-    print(f"Processing MySQL table: {MYSQL_DATABASE}.{MYSQL_TABLE}")
-    print(f"Content column: {MYSQL_CONTENT_COLUMN}")
+    print(f"Processing {database_backend(mysql_config)} table: {database}.{table}")
+    if tenant:
+        print(f"Company: {tenant.company_id}")
+    print(f"Content column: {content_column}")
     print(f"BM25 column: {bm25_column}")
     print(f"Primary key column: {detected_primary_key or 'none detected'}")
     print(f"Rows planned for ingestion: {planned_rows}")
@@ -248,7 +290,8 @@ def ingest_mysql_source(
             return
 
         print(
-            f"  Preparing rows {batch_start}-{batch_end}/{total_label} for Chroma "
+            f"  Preparing rows {batch_start}-{batch_end}/{total_label} for "
+            f"{tenant.storage.vector_backend if tenant else 'chroma'} "
             f"({len(upsert_documents)} changed/new)",
             flush=True,
         )
@@ -278,8 +321,19 @@ def ingest_mysql_source(
         metadatas = []
         bm25_rows = []
 
-    for row in iter_mysql_rows(MYSQL_CONTENT_COLUMN, detected_primary_key, limit):
-        prepared = prepare_mysql_row(row, MYSQL_CONTENT_COLUMN, detected_primary_key)
+    for row in iter_database_rows(
+        content_column,
+        detected_primary_key,
+        limit,
+        mysql_config,
+    ):
+        prepared = prepare_mysql_row(
+            row,
+            content_column,
+            detected_primary_key,
+            mysql_config=mysql_config,
+            company_id=tenant.company_id if tenant else None,
+        )
         if prepared is None:
             skipped_empty += 1
             continue
@@ -292,6 +346,8 @@ def ingest_mysql_source(
             row,
             bm25_column,
             detected_primary_key,
+            mysql_config=mysql_config,
+            company_id=tenant.company_id if tenant else None,
         )
         if bm25_row is not None:
             bm25_rows.append(bm25_row)
@@ -303,7 +359,8 @@ def ingest_mysql_source(
     bm25_count = bm25_index.count()
     bm25_index.close()
     print(
-        f"\nMySQL ingestion complete. Indexed/updated {indexed} rows; "
+        f"\n{database_backend(mysql_config).title()} ingestion complete. "
+        f"Indexed/updated {indexed} rows; "
         f"skipped unchanged {skipped_current} rows; skipped empty {skipped_empty} rows. "
         f"Collection contains {collection.count()} chunks. "
         f"BM25 index contains {bm25_count} products."
@@ -314,39 +371,72 @@ def rebuild_mysql_bm25_index(
     limit: int | None = None,
     batch_size: int = MYSQL_BATCH_SIZE,
     primary_key_column: str | None = None,
+    tenant: TenantProfile | None = None,
 ) -> None:
     if batch_size <= 0:
         raise RuntimeError("--mysql-batch-size must be greater than zero.")
     if limit is not None and limit <= 0:
         raise RuntimeError("--limit must be greater than zero.")
 
-    columns = fetch_mysql_columns()
-    if MYSQL_CONTENT_COLUMN not in columns:
-        raise RuntimeError(
-            f"Column '{MYSQL_CONTENT_COLUMN}' was not found in "
-            f"{MYSQL_DATABASE}.{MYSQL_TABLE}."
-        )
-    detected_primary_key = detect_mysql_primary_key(columns, primary_key_column)
-    bm25_column = (
-        MYSQL_BM25_COLUMN if MYSQL_BM25_COLUMN in columns else MYSQL_CONTENT_COLUMN
+    mysql_config = tenant.database if tenant else None
+    content_column = (
+        mysql_config.content_column if mysql_config else MYSQL_CONTENT_COLUMN
     )
-    row_count = count_mysql_rows(MYSQL_CONTENT_COLUMN)
+    database = mysql_config.database if mysql_config else MYSQL_DATABASE
+    table = mysql_config.search_table if mysql_config else MYSQL_TABLE
+    columns = fetch_database_columns(mysql_config)
+    if content_column not in columns:
+        raise RuntimeError(
+            f"Column '{content_column}' was not found in "
+            f"{database}.{table}."
+        )
+    detected_primary_key = detect_database_primary_key(
+        columns,
+        primary_key_column,
+        mysql_config,
+    )
+    bm25_column = (
+        mysql_config.bm25_column
+        if mysql_config and mysql_config.bm25_column in columns
+        else (
+            MYSQL_BM25_COLUMN
+            if MYSQL_BM25_COLUMN in columns
+            else content_column
+        )
+    )
+    row_count = count_database_rows(content_column, mysql_config)
     planned_rows = min(row_count, limit) if limit is not None else row_count
 
-    index = PersistentBM25Index()
+    index = (
+        PersistentBM25Index(tenant.storage.bm25_path)
+        if tenant
+        else PersistentBM25Index()
+    )
     index.clear()
     batch = []
     processed = 0
 
-    print(f"Rebuilding BM25 index from {MYSQL_DATABASE}.{MYSQL_TABLE}")
+    print(
+        f"Rebuilding BM25 index from {database_backend(mysql_config)} "
+        f"{database}.{table}"
+    )
+    if tenant:
+        print(f"Company: {tenant.company_id}")
     print(f"BM25 column: {bm25_column}")
     print(f"Rows planned: {planned_rows}")
 
-    for row in iter_mysql_rows(MYSQL_CONTENT_COLUMN, detected_primary_key, limit):
+    for row in iter_database_rows(
+        content_column,
+        detected_primary_key,
+        limit,
+        mysql_config,
+    ):
         entry = prepare_bm25_index_row(
             row,
             bm25_column,
             detected_primary_key,
+            mysql_config=mysql_config,
+            company_id=tenant.company_id if tenant else None,
         )
         if entry is None:
             continue

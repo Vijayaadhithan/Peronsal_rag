@@ -8,9 +8,9 @@ query_extraction:
   # Try the next model only when the current model is rate-limited or
   # temporarily unavailable.
   models:
+    - gemini-3.1-flash-lite
     - gemma-4-26b-a4b-it
     - gemma-4-31b-it
-    - gemini-3.1-flash-lite
   temperature: 0
   # Per-model deadline. Timeouts advance to the next configured model.
   timeout_seconds: 10
@@ -61,10 +61,35 @@ retrieval:
   reranker_batch_size: 4
   reranker_max_length: 512
   reranker_use_fp16: false
+  reranker_providers:
+    # Jina handles normal traffic. Each Voyage model has an independent,
+    # deliberately conservative request budget for this account.
+    order:
+      - jina
+      - voyage-2.5
+      - voyage-2.5-lite
+    timeout_seconds: 5
+    # Reranking 60 full 1.5K-character documents consumed roughly 20K+ tokens
+    # per search. The leading 800 characters retain the most useful labelled
+    # title/category/description content while reducing API usage.
+    max_document_chars: 800
+    voyage_model: rerank-2.5
+    voyage_lite_model: rerank-2.5-lite
+    voyage_requests_per_minute_per_model: 3
+    jina_model: jina-reranker-v2-base-multilingual
 
 api:
   host: 127.0.0.1
   port: 8000
+  # Local compatibility defaults to unauthenticated single-company mode.
+  # Production must set API_AUTH_ENABLED=true and configure one API key per
+  # company profile under configs/tenants/.
+  auth_enabled: false
+  rate_limit_enabled: true
+  tenant_config_dir: configs/tenants
+  # Bound open Chroma/BM25/database contexts on the 16 GB production host.
+  tenant_engine_cache_size: 8
+  tenant_max_concurrent_searches: 4
   # Use debug for library-level diagnostics; info shows the search flow.
   log_level: info
   # Load the reranker once when the API process starts. Requests reuse the
@@ -78,3 +103,5 @@ api:
   max_results: 200
   session_ttl_seconds: 600
   max_sessions: 500
+  usage_tracking_enabled: true
+  usage_db_path: storage/usage.sqlite3

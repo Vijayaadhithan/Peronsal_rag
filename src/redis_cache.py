@@ -1,5 +1,6 @@
 import json
 import logging
+import math
 import time
 from typing import Any
 
@@ -14,6 +15,29 @@ except ImportError:  # Allows diagnostics to explain a missing optional client.
 
 
 LOGGER = logging.getLogger("uvicorn.error")
+TOKEN_BUCKET_SCRIPT = """
+local key = KEYS[1]
+local now = tonumber(ARGV[1])
+local refill_per_ms = tonumber(ARGV[2])
+local capacity = tonumber(ARGV[3])
+local ttl_ms = tonumber(ARGV[4])
+local values = redis.call('HMGET', key, 'tokens', 'updated_ms')
+local tokens = tonumber(values[1])
+local updated_ms = tonumber(values[2])
+if tokens == nil then
+  tokens = capacity
+  updated_ms = now
+end
+tokens = math.min(capacity, tokens + ((now - updated_ms) * refill_per_ms))
+local allowed = 0
+if tokens >= 1 then
+  tokens = tokens - 1
+  allowed = 1
+end
+redis.call('HSET', key, 'tokens', tokens, 'updated_ms', now)
+redis.call('PEXPIRE', key, ttl_ms)
+return {allowed, math.floor(tokens)}
+"""
 
 
 class RedisJsonCache:
@@ -114,6 +138,37 @@ class RedisJsonCache:
         except (RedisError, OSError, TypeError) as exc:
             self._mark_failure("set", exc)
             return False
+
+    def allow_rate_limit(
+        self,
+        scope: str,
+        requests_per_minute: int,
+        burst: int,
+    ) -> tuple[bool, int] | None:
+        if not self._can_attempt():
+            return None
+        refill_per_ms = requests_per_minute / 60_000
+        ttl_ms = max(
+            60_000,
+            math.ceil((burst / refill_per_ms) * 2),
+        )
+        try:
+            result = self._client.eval(
+                TOKEN_BUCKET_SCRIPT,
+                1,
+                self._key("rate_limit", scope),
+                int(time.time() * 1000),
+                refill_per_ms,
+                burst,
+                ttl_ms,
+            )
+            self._mark_success()
+        except (RedisError, OSError, TypeError, ValueError) as exc:
+            self._mark_failure("rate_limit", exc)
+            return None
+        if not isinstance(result, (list, tuple)) or len(result) != 2:
+            return None
+        return bool(int(result[0])), int(result[1])
 
     def close(self) -> None:
         self._client.close()
